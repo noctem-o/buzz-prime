@@ -109,14 +109,48 @@ pub(super) const PROC_PIDTBSDINFO: libc::c_int = 3;
 
 // ── Sweep ownership rule ──────────────────────────────────────────────────────
 //
-// The `BUZZ_MANAGED_AGENT` env marker is the SOLE authoritative ownership
-// proof for sweep/receipt decisions. Do NOT name-gate via
+// The `BUZZ_MANAGED_AGENT` env marker remains the authoritative instance
+// ownership gate for sweep/receipt decisions. For a marked process, a live
+// ancestry/PGID relationship OR a matching start nonce from a currently
+// tracked harness generation proves that it is still owned. Do NOT name-gate via
 // `process_belongs_to_us` here — custom harnesses use arbitrary binary names
 // and a name-gated predicate would silently leak their orphans (the old Linux
 // AND-gate bug). `process_belongs_to_us` remains in use only as a cheap
 // pre-check on paths that already know the binary (see runtime/stop.rs).
-// On Windows no `/proc`-based sweep runs, so `process_has_buzz_marker`
-// always returns `false`.
+// On Windows no `/proc`-based sweep runs, so the platform sweep remains
+// unchanged.
+
+fn tracked_generation_nonces(skip_pids: &[u32]) -> std::collections::HashSet<String> {
+    skip_pids
+        .iter()
+        .filter_map(|pid| process_start_nonce(*pid))
+        .collect()
+}
+
+/// True when a marked candidate is still owned by a currently tracked
+/// generation. The ancestry result is authoritative when available; the
+/// nonce covers a detached/reparented descendant whose root is still live.
+fn is_owned_by_tracked_generation(
+    live_descendant: bool,
+    candidate_start_nonce: Option<&str>,
+    tracked_nonces: &std::collections::HashSet<String>,
+) -> bool {
+    live_descendant
+        || candidate_start_nonce
+            .is_some_and(|nonce| !nonce.is_empty() && tracked_nonces.contains(nonce))
+}
+
+fn process_is_owned_by_tracked_generation(
+    pid: u32,
+    live_descendant: bool,
+    tracked_nonces: &std::collections::HashSet<String>,
+) -> bool {
+    is_owned_by_tracked_generation(
+        live_descendant,
+        process_start_nonce(pid).as_deref(),
+        tracked_nonces,
+    )
+}
 
 /// Enumerate all processes on the system owned by the current user and kill any
 /// agent binary stamped with *this* instance's `BUZZ_MANAGED_AGENT` marker
@@ -125,7 +159,11 @@ pub(super) const PROC_PIDTBSDINFO: libc::c_int = 3;
 /// group whose parent harness already exited and had its PID file removed),
 /// while leaving another live Buzz instance's agents untouched.
 #[cfg(target_os = "macos")]
-pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32]) {
+pub(crate) fn sweep_system_agent_processes_with_tracked_nonces(
+    instance_id: &str,
+    skip_pids: &[u32],
+    tracked_nonces: &std::collections::HashSet<String>,
+) {
     let my_uid = unsafe { libc::getuid() };
     let pids = sweep::collect_all_pids();
     if pids.is_empty() {
@@ -166,7 +204,11 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
-        if sweep::is_live_descendant_macos(upid, info.pbi_ppid, skip_pids) {
+        if process_is_owned_by_tracked_generation(
+            upid,
+            sweep::is_live_descendant_macos(upid, info.pbi_ppid, skip_pids),
+            tracked_nonces,
+        ) {
             continue;
         }
         orphans.push(pid);
@@ -182,7 +224,11 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32]) {
+pub(crate) fn sweep_system_agent_processes_with_tracked_nonces(
+    instance_id: &str,
+    skip_pids: &[u32],
+    tracked_nonces: &std::collections::HashSet<String>,
+) {
     let my_uid = unsafe { libc::getuid() };
     let mut orphans: Vec<i32> = Vec::new();
     let my_pid = std::process::id() as i32;
@@ -219,7 +265,11 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
-        if sweep::is_live_descendant_linux(upid, skip_pids) {
+        if process_is_owned_by_tracked_generation(
+            upid,
+            sweep::is_live_descendant_linux(upid, skip_pids),
+            tracked_nonces,
+        ) {
             continue;
         }
         orphans.push(pid);
@@ -235,7 +285,20 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sweep_system_agent_processes(_instance_id: &str, _skip_pids: &[u32]) {}
+pub(crate) fn sweep_system_agent_processes_with_tracked_nonces(
+    _instance_id: &str,
+    _skip_pids: &[u32],
+    _tracked_nonces: &std::collections::HashSet<String>,
+) {
+}
+
+/// Compatibility wrapper for callers that only have tracked root PIDs.
+/// Production callers with runtime metadata pass the exact live-root nonce set
+/// to the precise variant above.
+pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32]) {
+    let tracked_nonces = tracked_generation_nonces(skip_pids);
+    sweep_system_agent_processes_with_tracked_nonces(instance_id, skip_pids, &tracked_nonces);
+}
 
 /// Periodic-sweep variant with two-tick grace: only reaps same-instance orphans
 /// that were also seen orphaned on the previous tick. This prevents killing a
@@ -243,12 +306,14 @@ pub(crate) fn sweep_system_agent_processes(_instance_id: &str, _skip_pids: &[u32
 /// the process scan. Returns the current orphan set for use as `prev_orphans`
 /// on the next tick.
 #[cfg(unix)]
-pub(crate) fn sweep_system_agent_processes_with_grace(
+pub(crate) fn sweep_system_agent_processes_with_grace_and_tracked_nonces(
     instance_id: &str,
     skip_pids: &[u32],
     prev_orphans: &std::collections::HashSet<u32>,
+    tracked_nonces: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u32> {
-    let current = collect_same_instance_orphans(instance_id, skip_pids);
+    let current =
+        collect_same_instance_orphans_with_tracked_nonces(instance_id, skip_pids, tracked_nonces);
     // Only reap PIDs seen orphaned on two consecutive ticks.
     let confirmed: Vec<i32> = current
         .iter()
@@ -266,10 +331,11 @@ pub(crate) fn sweep_system_agent_processes_with_grace(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sweep_system_agent_processes_with_grace(
+pub(crate) fn sweep_system_agent_processes_with_grace_and_tracked_nonces(
     _instance_id: &str,
     _skip_pids: &[u32],
     _prev_orphans: &std::collections::HashSet<u32>,
+    _tracked_nonces: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u32> {
     std::collections::HashSet::new()
 }
@@ -278,9 +344,10 @@ pub(crate) fn sweep_system_agent_processes_with_grace(
 /// `skip_pids`). Returns the set for use in two-tick grace logic — does NOT
 /// kill anything.
 #[cfg(target_os = "macos")]
-pub(crate) fn collect_same_instance_orphans(
+pub(crate) fn collect_same_instance_orphans_with_tracked_nonces(
     instance_id: &str,
     skip_pids: &[u32],
+    tracked_nonces: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u32> {
     let my_uid = unsafe { libc::getuid() };
     let my_pid = std::process::id() as i32;
@@ -322,7 +389,11 @@ pub(crate) fn collect_same_instance_orphans(
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
-        if sweep::is_live_descendant_macos(upid, info.pbi_ppid, skip_pids) {
+        if process_is_owned_by_tracked_generation(
+            upid,
+            sweep::is_live_descendant_macos(upid, info.pbi_ppid, skip_pids),
+            tracked_nonces,
+        ) {
             continue;
         }
         orphans.insert(upid);
@@ -331,9 +402,10 @@ pub(crate) fn collect_same_instance_orphans(
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn collect_same_instance_orphans(
+pub(crate) fn collect_same_instance_orphans_with_tracked_nonces(
     instance_id: &str,
     skip_pids: &[u32],
+    tracked_nonces: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u32> {
     let my_uid = unsafe { libc::getuid() };
     let my_pid = std::process::id() as i32;
@@ -370,7 +442,11 @@ pub(crate) fn collect_same_instance_orphans(
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
-        if sweep::is_live_descendant_linux(upid, skip_pids) {
+        if process_is_owned_by_tracked_generation(
+            upid,
+            sweep::is_live_descendant_linux(upid, skip_pids),
+            tracked_nonces,
+        ) {
             continue;
         }
         orphans.insert(upid);
@@ -379,9 +455,46 @@ pub(crate) fn collect_same_instance_orphans(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn collect_same_instance_orphans(
+pub(crate) fn collect_same_instance_orphans_with_tracked_nonces(
     _instance_id: &str,
     _skip_pids: &[u32],
+    _tracked_nonces: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<u32> {
     std::collections::HashSet::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_owned_by_tracked_generation;
+    use std::collections::HashSet;
+
+    #[test]
+    fn generation_ownership_requires_current_instance_and_exact_live_nonce() {
+        let tracked = HashSet::from(["generation-a".to_string()]);
+
+        // A live ancestry/root relationship is sufficient even when the
+        // candidate has no readable nonce (the direct tracked-root path).
+        assert!(is_owned_by_tracked_generation(true, None, &tracked));
+        // A detached candidate is protected only by an exact nonce from a
+        // currently tracked root.
+        assert!(is_owned_by_tracked_generation(
+            false,
+            Some("generation-a"),
+            &tracked
+        ));
+        assert!(!is_owned_by_tracked_generation(
+            false,
+            Some("generation-b"),
+            &tracked
+        ));
+        assert!(!is_owned_by_tracked_generation(false, Some(""), &tracked));
+        assert!(!is_owned_by_tracked_generation(false, None, &tracked));
+        // Once the root generation leaves the live set, historical ownership
+        // is not enough to spare the detached candidate.
+        assert!(!is_owned_by_tracked_generation(
+            false,
+            Some("generation-a"),
+            &HashSet::new()
+        ));
+    }
 }

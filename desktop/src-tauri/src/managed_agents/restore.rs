@@ -132,29 +132,34 @@ pub async fn restore_managed_agents_on_launch(
         changed |=
             kill_stale_tracked_processes(&mut records, &runtimes, &super::current_instance_id(app));
 
-        let tracked_pids: Vec<u32> = runtimes
-            .values()
-            .map(|runtime| runtime.child.id())
-            .chain(
-                super::read_all_agent_runtime_receipts(app)
-                    .into_iter()
-                    .filter_map(|(path, receipt)| {
-                        super::valid_agent_runtime_receipt(
-                            &path,
-                            &receipt,
-                            &super::current_instance_id(app),
-                        )
-                        .then_some(receipt.pid)
-                    }),
-            )
-            .collect();
+        let (mut tracked_pids, tracked_nonces): (Vec<u32>, std::collections::HashSet<String>) =
+            runtimes
+                .values()
+                .map(|runtime| (runtime.child.id(), runtime.start_nonce.clone()))
+                .unzip();
+        tracked_pids.extend(
+            super::read_all_agent_runtime_receipts(app)
+                .into_iter()
+                .filter_map(|(path, receipt)| {
+                    super::valid_agent_runtime_receipt(
+                        &path,
+                        &receipt,
+                        &super::current_instance_id(app),
+                    )
+                    .then_some(receipt.pid)
+                }),
+        );
         super::sweep_orphaned_agent_processes(app, &tracked_pids);
 
         // System-wide sweep: enumerate all user processes and kill any known
         // agent binaries not tracked by this session. Catches orphans whose
         // PID files were already cleaned up (e.g. agent workers in their own
         // process group whose parent harness exited).
-        super::sweep_system_agent_processes(&super::current_instance_id(app), &tracked_pids);
+        super::sweep_system_agent_processes_with_tracked_nonces(
+            &super::current_instance_id(app),
+            &tracked_pids,
+            &tracked_nonces,
+        );
 
         // Dead-instance reaping: find agents belonging to Buzz instances
         // whose desktop process is no longer running and reap them.

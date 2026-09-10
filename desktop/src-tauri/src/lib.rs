@@ -471,18 +471,27 @@ pub fn run() {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
+                    let (skip_pids, tracked_nonces): (Vec<u32>, HashSet<String>) = state
                         .managed_agent_processes
                         .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+                        .map(|runtimes| {
+                            runtimes
+                                .values()
+                                .map(|rt| (rt.child.id(), rt.start_nonce.clone()))
+                                .unzip()
+                        })
                         .unwrap_or_default();
                     let prev = prev_orphans.clone();
                     let inst = instance_id.clone();
                     // Run the blocking syscall work off the async executor.
                     let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
+                        let orphans =
+                            managed_agents::sweep_system_agent_processes_with_grace_and_tracked_nonces(
+                                &inst,
+                                &skip_pids,
+                                &prev,
+                                &tracked_nonces,
+                            );
                         managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
                         orphans
                     })
