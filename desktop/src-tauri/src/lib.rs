@@ -470,15 +470,16 @@ pub fn run() {
                 let mut prev_orphans: HashSet<u32> = HashSet::new();
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
+                    // Build the sweep inputs from live roots only: a dead
+                    // root's nonce must not keep a detached descendant exempted
+                    // until a foreground sync runs (R1). `live_root_sweep_inputs`
+                    // probes each child with try_wait, reaps dead roots here,
+                    // and caches their exit status for the foreground sync.
                     let (skip_pids, tracked_nonces): (Vec<u32>, HashSet<String>) = state
                         .managed_agent_processes
                         .lock()
-                        .map(|runtimes| {
-                            runtimes
-                                .values()
-                                .map(|rt| (rt.child.id(), rt.start_nonce.clone()))
-                                .unzip()
+                        .map(|mut runtimes| {
+                            managed_agents::live_root_sweep_inputs(&mut runtimes)
                         })
                         .unwrap_or_default();
                     let prev = prev_orphans.clone();

@@ -185,4 +185,239 @@ exit 0"#
             "historical nonce must not confer indefinite liveness: {no_live_generation:?}"
         );
     }
+
+    // ── R1 witness: dead-root liveness gating bound to the production seam ──
+    //
+    // The periodic loop in `lib.rs` builds its sweep inputs through
+    // `managed_agents::live_root_sweep_inputs` under the runtime lock. These
+    // tests feed real root/descendant processes through that exact function
+    // and the real two-tick grace sweep — no foreground
+    // `list_managed_agents` sync ever runs between ticks.
+
+    /// Build a runtime-map entry the way the spawn path does, around a real
+    /// `Child` handle, so the sweep-input builder probes the real process.
+    fn pair_runtime_for(
+        child: Child,
+        nonce: &str,
+    ) -> (
+        crate::managed_agents::ManagedAgentRuntimeKey,
+        crate::managed_agents::ManagedAgentPairRuntime,
+    ) {
+        let key = crate::managed_agents::ManagedAgentRuntimeKey::new(
+            "cc".repeat(32),
+            "wss://relay.example",
+        )
+        .expect("runtime key fixture");
+        let process = crate::managed_agents::ManagedAgentProcess {
+            child,
+            log_path: Default::default(),
+            spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                &super::super::test_fixtures::fixture(
+                    crate::managed_agents::types::RespondTo::default(),
+                    vec![],
+                    None,
+                ),
+                &[],
+                &[],
+                "wss://relay.example",
+                &Default::default(),
+                false,
+                crate::managed_agents::AcpSessionPolicy::Channel,
+            ),
+            setup_mode: false,
+            adapter_availability: None,
+            start_nonce: nonce.to_string(),
+            #[cfg(windows)]
+            job: None,
+        };
+        (
+            key,
+            crate::managed_agents::ManagedAgentPairRuntime::starting(process),
+        )
+    }
+
+    fn sweep_tick(
+        instance_id: &str,
+        skip_pids: &[u32],
+        prev: &HashSet<u32>,
+        tracked_nonces: &HashSet<String>,
+    ) -> HashSet<u32> {
+        crate::managed_agents::runtime::orphan_sweep::sweep_system_agent_processes_with_grace_and_tracked_nonces(
+            instance_id,
+            skip_pids,
+            prev,
+            tracked_nonces,
+        )
+    }
+
+    fn wait_for_exit(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !process_is_running(pid) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} did not exit within the grace window"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn dead_root_stale_nonce_becomes_reclaimable_without_foreground_sync() {
+        let instance_id = format!("buzz-test-instance-{}", Uuid::new_v4());
+        let nonce = format!("generation-{}", Uuid::new_v4());
+        // The root exits on its own while the runtime map keeps holding its
+        // (now dead) child handle — exactly the stale bookkeeping R1
+        // describes. No foreground sync runs between ticks.
+        let mut harness = Harness::spawn(&instance_id, Some(&nonce), false);
+        let root_child = harness.root.take().expect("root child handle");
+        let root_pid = root_child.id();
+        let (key, runtime) = pair_runtime_for(root_child, &nonce);
+        let mut runtimes = std::collections::HashMap::from([(key, runtime)]);
+
+        // Tick 1: the production input builder must not trust the dead
+        // root's nonce (nor skip its pid). The descendant becomes a reclaim
+        // candidate, but the two-tick grace keeps it alive this tick.
+        let (skip_pids, tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+        assert!(
+            !tracked_nonces.contains(&nonce),
+            "dead root's stale nonce must not be trusted without a live root: {tracked_nonces:?}"
+        );
+        assert!(!skip_pids.contains(&root_pid));
+        let tick1 = sweep_tick(&instance_id, &skip_pids, &HashSet::new(), &tracked_nonces);
+        assert!(
+            tick1.contains(&harness.detached_pid),
+            "detached descendant retaining the stale nonce must be a reclaim candidate: {tick1:?}"
+        );
+        assert!(
+            process_is_running(harness.detached_pid),
+            "two-tick grace must keep the descendant alive on the first tick"
+        );
+
+        // Tick 2: still no foreground sync. The same stale map entry must
+        // produce no trust, the grace window closes, and the descendant is
+        // reclaimed.
+        let (skip_pids, tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+        assert!(
+            !tracked_nonces.contains(&nonce),
+            "stale nonce must not resurface on later ticks: {tracked_nonces:?}"
+        );
+        let tick2 = sweep_tick(&instance_id, &skip_pids, &tick1, &tracked_nonces);
+        assert!(tick2.contains(&harness.detached_pid));
+        wait_for_exit(harness.detached_pid);
+        assert!(
+            !process_is_running(harness.detached_pid),
+            "descendant must be reclaimed on the second tick with no foreground sync"
+        );
+    }
+
+    #[test]
+    fn live_root_keeps_protecting_detached_descendant_across_sweep_ticks() {
+        let instance_id = format!("buzz-test-instance-{}", Uuid::new_v4());
+        let nonce = format!("generation-{}", Uuid::new_v4());
+        // Root stays live; its detached worker keeps the same nonce.
+        let mut harness = Harness::spawn(&instance_id, Some(&nonce), true);
+        let root_pid = harness.root_pid();
+        let root_child = harness.root.take().expect("root child handle");
+        let (key, runtime) = pair_runtime_for(root_child, &nonce);
+        let mut runtimes = std::collections::HashMap::from([(key, runtime)]);
+
+        let (skip_pids, tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+        assert!(
+            skip_pids.contains(&root_pid),
+            "live root pid must enter the skip list: {skip_pids:?}"
+        );
+        assert!(
+            tracked_nonces.contains(&nonce),
+            "live root's nonce must be trusted: {tracked_nonces:?}"
+        );
+        let tick1 = sweep_tick(&instance_id, &skip_pids, &HashSet::new(), &tracked_nonces);
+        assert!(
+            !tick1.contains(&harness.detached_pid),
+            "live root must keep protecting its detached descendant: {tick1:?}"
+        );
+        let (skip_pids, tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+        let tick2 = sweep_tick(&instance_id, &skip_pids, &tick1, &tracked_nonces);
+        assert!(!tick2.contains(&harness.detached_pid));
+        assert!(
+            process_is_running(harness.detached_pid),
+            "live root must keep protecting its detached descendant across ticks"
+        );
+
+        // Tear down the live root; `Harness::drop` reaps the detached worker.
+        if let Some(runtime) = runtimes.values_mut().next() {
+            let _ = runtime.child.kill();
+            let _ = runtime.child.wait();
+        }
+    }
+
+    #[test]
+    fn already_reaped_root_is_not_trusted_by_sweep_inputs() {
+        let instance_id = format!("buzz-test-instance-{}", Uuid::new_v4());
+        let nonce = format!("generation-{}", Uuid::new_v4());
+        let mut harness = Harness::spawn(&instance_id, Some(&nonce), false);
+        let root_pid = harness.root_pid();
+        // Foreground-sync-shaped reaping: the child is waited on before the
+        // sweep probes it, so the probe hits the same ECHILD branch that a
+        // reused PID would — neither may keep the nonce trusted.
+        let mut root_child = harness.root.take().expect("root child handle");
+        root_child.wait().expect("reap generation root");
+        let (key, runtime) = pair_runtime_for(root_child, &nonce);
+        let mut runtimes = std::collections::HashMap::from([(key, runtime)]);
+
+        let (skip_pids, tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+        assert!(
+            !tracked_nonces.contains(&nonce),
+            "an already-reaped (or PID-reused) root must not keep its nonce trusted: {tracked_nonces:?}"
+        );
+        assert!(!skip_pids.contains(&root_pid));
+    }
+
+    #[test]
+    fn background_reap_preserves_real_exit_status_for_foreground_sync() {
+        let instance_id = format!("buzz-test-instance-{}", Uuid::new_v4());
+        let nonce = format!("generation-{}", Uuid::new_v4());
+        let mut harness = Harness::spawn(&instance_id, Some(&nonce), false);
+        let root_child = harness.root.take().expect("root child handle");
+        let (key, runtime) = pair_runtime_for(root_child, &nonce);
+        let mut runtimes = std::collections::HashMap::from([(key.clone(), runtime)]);
+
+        // Background sweep reaps the dead root and caches its exit status.
+        let (_skip_pids, _tracked_nonces) =
+            crate::managed_agents::live_root_sweep_inputs(&mut runtimes);
+
+        // A later foreground sync must record the real exit status (the root
+        // shell exits 0), not a "failed to inspect process state" error.
+        let mut record = super::super::test_fixtures::fixture(
+            crate::managed_agents::types::RespondTo::default(),
+            vec![],
+            None,
+        );
+        record.pubkey = key.pubkey.clone();
+        let mut records = vec![record];
+        let (changed, exited) = crate::managed_agents::sync_managed_agent_processes(
+            &mut records,
+            &mut runtimes,
+            &instance_id,
+        );
+        assert!(
+            changed && exited.len() == 1,
+            "sync must process the background-reaped root: {exited:?}"
+        );
+        assert!(runtimes.is_empty(), "sync must remove the exited runtime");
+        assert!(records[0].last_stopped_at.is_some());
+        assert_eq!(records[0].last_exit_code, Some(0));
+        assert!(
+            records[0].last_error.is_none(),
+            "real exit status must not be reported as an inspect error: {:?}",
+            records[0].last_error
+        );
+    }
 }

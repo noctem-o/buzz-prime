@@ -72,6 +72,7 @@ use instance_reaper::{buffer_contains_identifier, is_desktop_binary};
 mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
+pub(crate) use lifecycle::live_root_sweep_inputs;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;

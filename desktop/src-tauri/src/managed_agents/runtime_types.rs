@@ -50,6 +50,11 @@ pub struct ManagedAgentPairRuntime {
     /// Unpredictable identity for this exact harness generation. Lifecycle
     /// frames from prior processes are rejected even when the pair is live.
     pub start_nonce: String,
+    /// Exit status captured when the periodic sweep reaped this dead harness
+    /// before any foreground sync ran. Runtime-only. The foreground sync
+    /// prefers this over the `ECHILD` a second `try_wait` would surface, so
+    /// the record keeps the real exit code instead of an inspect error.
+    pub reaped_exit_status: Option<std::process::ExitStatus>,
 }
 
 impl std::ops::Deref for ManagedAgentPairRuntime {
@@ -74,6 +79,7 @@ impl ManagedAgentPairRuntime {
             lifecycle: ManagedAgentRuntimeLifecycle::Starting,
             error: None,
             start_nonce,
+            reaped_exit_status: None,
         }
     }
 }
