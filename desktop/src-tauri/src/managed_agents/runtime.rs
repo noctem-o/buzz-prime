@@ -45,7 +45,8 @@ use process::{
 };
 pub(crate) use process::{
     current_instance_id, process_belongs_to_us, process_has_buzz_marker, process_is_running,
-    terminate_process, terminate_untracked_pair_runtime, valid_agent_runtime_receipt,
+    process_start_nonce, terminate_process, terminate_untracked_pair_runtime,
+    valid_agent_runtime_receipt,
 };
 
 mod orphan_sweep;
@@ -53,7 +54,8 @@ mod orphan_sweep;
 use orphan_sweep::proc_pidinfo;
 pub(crate) use orphan_sweep::{
     sweep_orphaned_agent_processes, sweep_system_agent_processes,
-    sweep_system_agent_processes_with_grace,
+    sweep_system_agent_processes_with_grace_and_tracked_nonces,
+    sweep_system_agent_processes_with_tracked_nonces,
 };
 #[cfg(target_os = "macos")]
 use orphan_sweep::{BSDInfo, PROC_PIDTBSDINFO};
@@ -70,6 +72,7 @@ use instance_reaper::{buffer_contains_identifier, is_desktop_binary};
 mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
+pub(crate) use lifecycle::live_root_sweep_inputs;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
@@ -934,6 +937,10 @@ pub fn start_managed_agent_process(
 
 #[cfg(test)]
 mod test_fixtures;
+
+#[cfg(test)]
+#[path = "runtime/tests/orphan_generation.rs"]
+mod orphan_generation;
 
 #[cfg(test)]
 mod tests;

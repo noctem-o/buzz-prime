@@ -9,6 +9,7 @@
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
 use futures_util::StreamExt;
+use std::collections::HashSet;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -106,6 +107,24 @@ pub enum AcpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("Agent did not advertise session/close; cannot release session {session_id}")]
+    SessionCloseUnsupported { session_id: String },
+
+    #[error("session/close failed; connection ownership is uncertain: {source}")]
+    SessionCloseFailed {
+        #[source]
+        source: Box<AcpError>,
+    },
+
+    #[error("ACP connection session capacity {capacity} is already full")]
+    SessionCapacityExceeded { capacity: usize },
+
+    #[error("ACP session setup failed: {primary}; cleanup also failed: {cleanup}")]
+    SetupAndCleanupFailed {
+        primary: Box<AcpError>,
+        cleanup: Box<AcpError>,
+    },
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }
@@ -117,7 +136,17 @@ pub enum AcpError {
 fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
     let message = match error.get("message").and_then(|m| m.as_str()) {
-        Some(m) => m.to_string(),
+        Some(m) => {
+            let details = error
+                .pointer("/data/details")
+                .and_then(|details| details.as_str())
+                .map(str::trim)
+                .filter(|details| !details.is_empty());
+            match details {
+                Some(details) if !m.contains(details) => format!("{m}: {details}"),
+                _ => m.to_string(),
+            }
+        }
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
@@ -208,6 +237,18 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Whether `initialize` advertised the standard `session/close` capability.
+    session_close_supported: bool,
+    /// Optional operator-declared maximum number of live sessions on this
+    /// ACP connection. `None` preserves historical multi-session behavior.
+    max_sessions_per_connection: Option<usize>,
+    /// Sessions created on this connection and not yet confirmed closed.
+    /// This is the client-side capacity ledger; pool state supplies the scope
+    /// ownership ledger.
+    remote_sessions: HashSet<String>,
+    /// Session IDs whose local scope ownership was invalidated before an async
+    /// ACP lifecycle seam was available. They remain remote-owned until close.
+    pending_session_closes: Vec<String>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -560,6 +601,10 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            session_close_supported: false,
+            max_sessions_per_connection: None,
+            remote_sessions: HashSet::new(),
+            pending_session_closes: Vec::new(),
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -617,6 +662,9 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.session_close_supported = result
+            .pointer("/agentCapabilities/sessionCapabilities/close")
+            .is_some_and(serde_json::Value::is_object);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -655,6 +703,12 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        self.close_pending_sessions().await?;
+        if let Some(capacity) = self.max_sessions_per_connection {
+            if self.remote_sessions.len() >= capacity {
+                return Err(AcpError::SessionCapacityExceeded { capacity });
+            }
+        }
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -679,6 +733,13 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
         tracing::info!(target: "acp::session", "session created: {session_id}");
+        // The ledger drives capacity accounting and close-before-invalidate,
+        // both of which only exist on bounded connections. Legacy unbounded
+        // connections never send `session/close`, so their session IDs would
+        // accumulate here forever; track only what the bookkeeping needs.
+        if self.has_bounded_session_capacity() {
+            self.remote_sessions.insert(session_id.clone());
+        }
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -851,6 +912,87 @@ impl AcpClient {
             "sessionId": session_id,
         });
         self.send_notification("session/cancel", params).await
+    }
+
+    /// Send a negotiated `session/close` request and release one remote
+    /// session. The request is never sent unless the agent advertised the
+    /// capability during `initialize`.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        if !self.session_close_supported {
+            return Err(AcpError::SessionCloseUnsupported {
+                session_id: session_id.to_owned(),
+            });
+        }
+        self.send_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .map(|_| ())?;
+        self.remote_sessions.remove(session_id);
+        self.pending_session_closes
+            .retain(|pending| pending != session_id);
+        Ok(())
+    }
+
+    pub fn session_close_supported(&self) -> bool {
+        self.session_close_supported
+    }
+
+    pub(crate) fn set_max_sessions_per_connection(&mut self, max: Option<usize>) {
+        debug_assert!(max.is_none_or(|value| value > 0));
+        self.max_sessions_per_connection = max;
+    }
+
+    pub(crate) fn has_bounded_session_capacity(&self) -> bool {
+        self.max_sessions_per_connection.is_some()
+    }
+
+    pub(crate) fn live_session_count(&self) -> usize {
+        self.remote_sessions.len()
+    }
+
+    pub(crate) fn can_open_session(&self, live_session_count: usize) -> bool {
+        self.max_sessions_per_connection
+            .is_none_or(|max| live_session_count < max)
+    }
+
+    pub(crate) fn queue_session_close(&mut self, session_id: &str) {
+        if !self
+            .pending_session_closes
+            .iter()
+            .any(|pending| pending == session_id)
+        {
+            self.pending_session_closes.push(session_id.to_owned());
+        }
+    }
+
+    /// Queue one remotely-owned session when local scope bookkeeping no
+    /// longer names it. This is the bounded-capacity recovery path for a
+    /// setup/invalidation race: the connection must still release the remote
+    /// ownership before it can admit another session.
+    pub(crate) fn queue_one_live_session_close(&mut self) -> Option<String> {
+        let session_id = self.remote_sessions.iter().next()?.clone();
+        self.queue_session_close(&session_id);
+        Some(session_id)
+    }
+
+    pub(crate) fn has_pending_session_closes(&self) -> bool {
+        !self.pending_session_closes.is_empty()
+    }
+
+    pub(crate) async fn close_pending_sessions(&mut self) -> Result<(), AcpError> {
+        while let Some(session_id) = self.pending_session_closes.first().cloned() {
+            if let Err(error) = self.session_close(&session_id).await {
+                return Err(match error {
+                    AcpError::SessionCloseUnsupported { .. } => error,
+                    other => AcpError::SessionCloseFailed {
+                        source: Box::new(other),
+                    },
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` if a `session/prompt` request is currently in flight.
@@ -3029,6 +3171,157 @@ mod tests {
             .expect("failed to spawn test script")
     }
 
+    #[tokio::test]
+    async fn capacity_one_rejects_second_session_before_wire() {
+        // This is the regression witness for one-session runtimes: after A/new
+        // succeeds, the old Buzz behavior sent B/new on the same connection and
+        // received the provider's -32603 rejection. The capacity guard must
+        // reject before a second request reaches the adapter.
+        let script = r#"
+            read -r initialize
+            printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -r session_a
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-a"}}'
+            if read -t 1 -r session_b; then
+                printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Internal error","data":{"details":"one session per connection"}}}'
+            fi
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session A/new should succeed");
+
+        let result = client.session_new_full("/tmp", vec![], None, None).await;
+        assert!(matches!(
+            result,
+            Err(AcpError::SessionCapacityExceeded { capacity: 1 })
+        ));
+        assert_eq!(client.live_session_count(), 1);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_unbounded_connection_reproduces_second_session_rejection() {
+        // This is the observed pre-capacity behavior. With no operator-declared
+        // bound, Buzz sends B/new on the already occupied connection and the
+        // one-session adapter rejects it. The generic capacity guard above is
+        // what changes this path for runtimes configured with capacity=1.
+        let mut client = spawn_script(
+            r#"
+            read -r initialize
+            printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -r session_a
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-a"}}'
+            read -r session_b
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Internal error","data":{"details":"prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session"}}}'
+            sleep 1
+            "#,
+        )
+        .await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.has_bounded_session_capacity());
+        client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session A/new should succeed");
+
+        let result = client.session_new_full("/tmp", vec![], None, None).await;
+        assert!(matches!(
+            result,
+            Err(AcpError::AgentError { code: -32603, ref message })
+                if message.contains("one session per connection")
+                    && message.contains("start another prime-agent process")
+        ));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_close_precedes_next_session_new_on_bounded_connection() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-close-before-new-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+            read -r initialize
+            printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{"sessionCapabilities":{{"close":{{}}}}}}}}}}'
+            read -r session_a
+            printf '%s\n' "$session_a" >> '{quoted_capture}'
+            printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"session-a"}}}}'
+            read -r close
+            printf '%s\n' "$close" >> '{quoted_capture}'
+            printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+            read -r session_b
+            printf '%s\n' "$session_b" >> '{quoted_capture}'
+            printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"sessionId":"session-b"}}}}'
+            sleep 1
+            "#
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let first = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session A/new should succeed");
+        client.queue_session_close(&first.session_id);
+        let second = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("close must release capacity before session B/new");
+        assert_eq!(second.session_id, "session-b");
+        client.shutdown().await;
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read close-before-new requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("request is JSON"))
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .filter_map(|request| request["method"].as_str())
+                .collect::<Vec<_>>(),
+            ["session/new", "session/close", "session/new"]
+        );
+        std::fs::remove_file(capture).expect("remove close-before-new capture");
+    }
+
+    #[tokio::test]
+    async fn unsupported_session_close_never_writes_an_unsupported_request() {
+        let mut client = spawn_script(
+            r#"
+            read -r initialize
+            printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            sleep 1
+            "#,
+        )
+        .await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(matches!(
+            client.session_close("session-a").await,
+            Err(AcpError::SessionCloseUnsupported { session_id }) if session_id == "session-a"
+        ));
+        client.shutdown().await;
+    }
+
     #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -4796,6 +5089,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_error_from_json_preserves_provider_details() {
+        let error = serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "details": "prime-agent ACP mode hosts one session per connection; start another process"
+            }
+        });
+        let AcpError::AgentError { code, message } = super::agent_error_from_json(&error) else {
+            panic!("expected AgentError");
+        };
+        assert_eq!(code, -32603);
+        assert!(message.contains("Internal error"));
+        assert!(message.contains("one session per connection"));
+    }
+
+    #[test]
+    fn agent_error_from_json_does_not_duplicate_details() {
+        let error = serde_json::json!({
+            "code": -32603,
+            "message": "Internal error: one session per connection",
+            "data": {"details": "one session per connection"}
+        });
+        let AcpError::AgentError { message, .. } = super::agent_error_from_json(&error) else {
+            panic!("expected AgentError");
+        };
+        assert_eq!(message.matches("one session per connection").count(), 1);
+    }
+
+    #[test]
+    fn setup_and_cleanup_error_display_preserves_both_causes() {
+        let error = AcpError::SetupAndCleanupFailed {
+            primary: Box::new(AcpError::AgentError {
+                code: -32602,
+                message: "model rejected".into(),
+            }),
+            cleanup: Box::new(AcpError::SessionCloseUnsupported {
+                session_id: "session-a".into(),
+            }),
+        };
+        let message = error.to_string();
+        assert!(message.contains("model rejected"));
+        assert!(message.contains("cannot release session session-a"));
+    }
+
     // ── build_codex_config_env ────────────────────────────────────────────────
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -5026,5 +5365,137 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+
+    // ── R3: bounded-capacity bookkeeping must not accumulate an unbounded
+    //    historical remote-session-ID ledger in legacy unbounded mode ──────
+
+    #[tokio::test]
+    async fn legacy_unbounded_rotations_keep_remote_session_ledger_bounded() {
+        // Repeated session rotations on a legacy unbounded connection must not
+        // grow the remote-session ledger without bound: in unbounded mode the
+        // ledger serves no purpose (no capacity accounting, no close to queue)
+        // and nothing ever removes entries from it.
+        let script = r#"
+            while IFS= read -r line; do
+              id=${line#*\"id\":}; id=${id%%,*}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"sessionId":"rot-'$id'"}}' ;;
+              esac
+            done
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.has_bounded_session_capacity());
+        for _ in 0..8 {
+            client
+                .session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("legacy unbounded rotation must reach the wire");
+        }
+        assert!(
+            client.remote_sessions.is_empty(),
+            "unbounded-mode ledger accumulated historical session IDs: {:?}",
+            client.remote_sessions
+        );
+        assert_eq!(client.live_session_count(), 0);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_remote_session_ledger_still_tracks_new_and_close() {
+        // The R3 gate must not weaken bounded-mode bookkeeping: every new
+        // session is tracked and removed again on close.
+        let script = r#"
+            while IFS= read -r line; do
+              id=${line#*\"id\":}; id=${id%%,*}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"sessionId":"ledger-'$id'"}}' ;;
+                *'"method":"session/close"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{}}' ;;
+              esac
+            done
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session/new should succeed")
+            .session_id;
+        assert_eq!(client.live_session_count(), 1);
+        assert!(client.remote_sessions.contains(&sid));
+        client
+            .session_close(&sid)
+            .await
+            .expect("session/close should succeed");
+        assert_eq!(client.live_session_count(), 0);
+        assert!(!client.remote_sessions.contains(&sid));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_unbounded_wire_still_sends_each_rotation_and_never_closes() {
+        // Legacy unbounded wire semantics are unchanged by the R3 gate: every
+        // rotation is still sent as a real `session/new`, and no
+        // `session/close` is ever emitted on the wire.
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-unbounded-wire-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+            : > '{quoted_capture}'
+            while IFS= read -r line; do
+              printf '%s\n' "$line" >> '{quoted_capture}'
+              id=${{line#*\"id\":}}; id=${{id%%,*}}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"sessionId":"wire-'$id'"}}}}' ;;
+              esac
+            done
+            "#
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.has_bounded_session_capacity());
+        for _ in 0..4 {
+            client
+                .session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("rotation must reach the wire");
+        }
+        client.shutdown().await;
+        let wire = std::fs::read_to_string(&capture).expect("capture written");
+        let _ = std::fs::remove_file(&capture);
+        let news = wire
+            .lines()
+            .filter(|l| l.contains("\"method\":\"session/new\""))
+            .count();
+        let closes = wire
+            .lines()
+            .filter(|l| l.contains("\"method\":\"session/close\""))
+            .count();
+        assert_eq!(news, 4, "legacy wire must carry every rotation: {wire}");
+        assert_eq!(closes, 0, "legacy unbounded wire must never close: {wire}");
     }
 }

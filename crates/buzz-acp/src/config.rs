@@ -35,6 +35,15 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_string())?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or_else(|| "must be greater than zero".to_string())
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to parse nostr keys: {0}")]
@@ -299,6 +308,15 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32).range(1..=32))]
     pub agents: u32,
 
+    /// Optional operator-declared maximum number of live ACP sessions per
+    /// connection. Unset preserves the historical multi-session behavior.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_MAX_SESSIONS_PER_CONNECTION",
+        value_parser = parse_positive_usize
+    )]
+    pub max_sessions_per_connection: Option<usize>,
+
     /// Seconds between heartbeat prompts. 0 = disabled.
     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
     pub heartbeat_interval: u64,
@@ -546,6 +564,9 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
+    /// Optional operator-declared ACP connection session capacity. `None`
+    /// retains the legacy multi-session admission policy.
+    pub max_sessions_per_connection: Option<usize>,
     pub heartbeat_interval_secs: u64,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
@@ -1159,6 +1180,7 @@ impl Config {
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
+            max_sessions_per_connection: args.max_sessions_per_connection,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
             heartbeat_prompt,
@@ -1225,7 +1247,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} max_sessions_per_connection={:?} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1234,6 +1256,7 @@ impl Config {
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
             self.agents,
+            self.max_sessions_per_connection,
             self.heartbeat_interval_secs,
             self.subscribe_mode,
             self.dedup_mode,
@@ -1543,6 +1566,7 @@ mod tests {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            max_sessions_per_connection: None,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
@@ -2322,6 +2346,40 @@ channels = "ALL"
     }
 
     #[test]
+    fn max_sessions_per_connection_defaults_unset() {
+        let key = "0".repeat(64);
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(args.max_sessions_per_connection, None);
+    }
+
+    #[test]
+    fn max_sessions_per_connection_flag_accepts_positive_value() {
+        let key = "0".repeat(64);
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--max-sessions-per-connection",
+            "1",
+        ]);
+        assert_eq!(args.max_sessions_per_connection, Some(1));
+    }
+
+    #[test]
+    fn max_sessions_per_connection_rejects_zero() {
+        let key = "0".repeat(64);
+        let error = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--max-sessions-per-connection",
+            "0",
+        ])
+        .expect_err("zero is not a valid connection capacity");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn test_summary_includes_agents_and_heartbeat() {
         let config = test_config(SubscribeMode::Mentions);
         let s = config.summary();
@@ -2349,6 +2407,15 @@ channels = "ALL"
             s.contains("heartbeat=30s"),
             "summary should include heartbeat=30s, got: {s}"
         );
+    }
+
+    #[test]
+    fn test_summary_includes_max_sessions_per_connection() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.max_sessions_per_connection = Some(1);
+        assert!(config
+            .summary()
+            .contains("max_sessions_per_connection=Some(1)"));
     }
 
     #[test]

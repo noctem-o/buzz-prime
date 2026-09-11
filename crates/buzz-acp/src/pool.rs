@@ -258,14 +258,12 @@ pub struct OwnedAgent {
     /// Desktop ModelPicker can correlate it to the pick that fired the switch.
     /// `None` for config/persona-derived models (no live pick to correlate).
     pub desired_model_request_id: Option<String>,
-    /// True when a busy-path live switch is awaiting its deferred apply: the
-    /// switch was delivered to an in-flight turn (`sent` ack), the turn was
-    /// cancelled+requeued, and the real apply runs at the next session. On that
-    /// apply, `create_session_and_apply_model` emits a positive terminal
-    /// `control_result` (success) so the Desktop learns the outcome instead of
-    /// inferring it from timeout silence. The idle path never sets this — it
-    /// already emits its terminal immediately — so this gate prevents a
-    /// double-emit there. Consumed (reset) at apply time.
+    /// True when a live switch is awaiting its deferred apply: the switch was
+    /// delivered to an in-flight turn (`sent` ack), or an idle session was
+    /// invalidated, and the real apply runs at the next session. On that apply,
+    /// `create_session_and_apply_model` emits the authoritative terminal
+    /// `control_result` (success or failure) so the Desktop does not infer a
+    /// result from timeout silence. Consumed (reset) at apply time.
     pub desired_model_pending_ack: bool,
     /// Persisted startup effort value from `BUZZ_ACP_EFFORT_LEVEL` (carried from
     /// the Desktop record via `Config.effort_level`). Held per-worker and applied
@@ -328,6 +326,76 @@ impl OwnedAgent {
             &self.agent_name,
             self.goose_system_prompt_supported,
         )
+    }
+
+    fn live_session_count(&self) -> usize {
+        // The ACP ledger is authoritative for remote ownership. The state
+        // fallback keeps hand-built/test agents and pre-ledger state
+        // conservative: a locally remembered session must never make a
+        // capacity-bounded connection look empty.
+        self.acp
+            .live_session_count()
+            .max(self.state.sessions.len() + usize::from(self.state.heartbeat_session.is_some()))
+    }
+
+    fn can_create_session(&self) -> bool {
+        self.acp.can_open_session(self.live_session_count())
+    }
+
+    /// Queue the remote close for an invalidated session when the operator has
+    /// opted into bounded connection capacity. Legacy unbounded connections
+    /// deliberately retain their historical multi-session behavior.
+    fn queue_session_close_for_invalidation(&mut self, session_id: &str) {
+        if self.acp.has_bounded_session_capacity() {
+            self.acp.queue_session_close(session_id);
+        }
+    }
+
+    fn queue_scope_close_for_invalidation(&mut self, scope: &SessionScope) {
+        if let Some(session_id) = self.state.sessions.get(scope).cloned() {
+            self.queue_session_close_for_invalidation(&session_id);
+        }
+    }
+
+    pub(crate) fn queue_channel_closes_for_invalidation(&mut self, channel_id: Uuid) {
+        let session_ids: Vec<String> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(scope, _)| scope.channel_id() == channel_id)
+            .map(|(_, session_id)| session_id.clone())
+            .collect();
+        for session_id in session_ids {
+            self.queue_session_close_for_invalidation(&session_id);
+        }
+    }
+
+    /// Remove one resident session so an independent scope can make progress
+    /// on a capacity-full idle connection. The caller owns the pool-level
+    /// scope-owner directory and removes its matching entry after this method
+    /// returns. Never call this for a checked-out agent.
+    fn evict_one_session(&mut self) -> Option<(Option<SessionScope>, String)> {
+        if let Some(scope) = self.state.sessions.keys().next().cloned() {
+            let session_id = self.state.sessions.get(&scope).cloned()?;
+            self.queue_session_close_for_invalidation(&session_id);
+            self.state.invalidate_scope(&scope);
+            return Some((Some(scope), session_id));
+        }
+        if let Some(session_id) = self.state.heartbeat_session.take() {
+            self.queue_session_close_for_invalidation(&session_id);
+            self.state.heartbeat_turn_count = 0;
+            self.state.heartbeat_standing_context_sent = false;
+            return Some((None, session_id));
+        }
+        if self.acp.has_bounded_session_capacity() {
+            if let Some(session_id) = self.acp.queue_one_live_session_close() {
+                // There is no local scope to invalidate. The checked-out
+                // prompt task still owns this worker and will flush the close
+                // before attempting its next session/new.
+                return Some((None, session_id));
+            }
+        }
+        None
     }
 }
 
@@ -430,6 +498,80 @@ fn apply_completed_before_control_signal(
         ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
     ) {
         state.invalidate(source);
+    }
+}
+
+/// Close a session that is being deliberately invalidated. Unbounded
+/// connections retain the historical behavior: local invalidation is safe for
+/// the legacy multi-session contract, and an adapter that does not advertise
+/// `session/close` is not forced through a replacement path merely because a
+/// session was rotated. A bounded connection, however, cannot be reused until
+/// its remote ownership is released or the connection is retired.
+async fn close_session_before_invalidation(
+    agent: &mut OwnedAgent,
+    session_id: &str,
+) -> Result<(), AcpError> {
+    if !agent.acp.has_bounded_session_capacity() {
+        return Ok(());
+    }
+    if !agent.acp.session_close_supported() {
+        return Err(AcpError::SessionCloseUnsupported {
+            session_id: session_id.to_owned(),
+        });
+    }
+    agent
+        .acp
+        .session_close(session_id)
+        .await
+        .map_err(|error| match error {
+            AcpError::SessionCloseUnsupported { .. } | AcpError::SessionCloseFailed { .. } => error,
+            other => AcpError::SessionCloseFailed {
+                source: Box::new(other),
+            },
+        })
+}
+
+fn setup_error_is_connection_fatal(error: &AcpError) -> bool {
+    matches!(
+        error,
+        AcpError::AgentExited
+            | AcpError::Io(_)
+            | AcpError::WriteTimeout(_)
+            | AcpError::Timeout(_)
+            | AcpError::Protocol(_)
+    )
+}
+
+/// Preserve the primary setup failure while recording a failed attempt to
+/// release the newly-created remote session. The composite also gives the
+/// supervisor enough provenance to retire the connection when ownership is
+/// uncertain, without replacing the useful setup diagnostic with a generic
+/// close error.
+async fn close_new_session_after_setup_failure(
+    agent: &mut OwnedAgent,
+    session_id: &str,
+    primary: AcpError,
+) -> AcpError {
+    if setup_error_is_connection_fatal(&primary) || !agent.acp.has_bounded_session_capacity() {
+        return primary;
+    }
+    match close_session_before_invalidation(agent, session_id).await {
+        Ok(()) => primary,
+        Err(cleanup) => AcpError::SetupAndCleanupFailed {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+fn combine_cleanup_error(primary: AcpError, cleanup: AcpError) -> AcpError {
+    if setup_error_is_connection_fatal(&primary) {
+        primary
+    } else {
+        AcpError::SetupAndCleanupFailed {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
     }
 }
 
@@ -952,7 +1094,11 @@ impl AgentPool {
     /// Pass 1: prefer an agent that already has a session for this exact scope
     /// (thread affinity — repeated activity in a thread reuses that thread's
     /// provider session).
-    /// Pass 2: any idle agent.
+    /// Pass 2: any idle agent that can create a session under the configured
+    /// connection capacity. If every idle bounded connection is full, evict a
+    /// resident session from one idle worker and queue its remote close. The
+    /// worker is then checked out by the caller, so a checked-out/in-flight
+    /// worker is never stolen.
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
@@ -968,9 +1114,81 @@ impl AgentPool {
             }
         }
 
-        // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        // Pass 2: prefer a worker with a free remote-session slot. Pending
+        // closes count as reclaimable capacity because the task will flush
+        // them before its next session/new.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_ref() else {
+                continue;
+            };
+            if agent.can_create_session() || agent.acp.has_pending_session_closes() {
+                return self.agents[idx].take();
+            }
+        }
+
+        // Every idle candidate is capacity-full. Make progress for an
+        // independent scope by evicting one resident local session. The
+        // matching remote session is queued for close and is flushed inside
+        // the checked-out prompt task, keeping the supervisor non-blocking.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_mut() else {
+                continue;
+            };
+            if !agent.acp.has_bounded_session_capacity() {
+                continue;
+            }
+            let Some((scope, _session_id)) = agent.evict_one_session() else {
+                continue;
+            };
+            if let Some(scope) = scope {
+                if self
+                    .session_owners
+                    .get(&scope)
+                    .is_some_and(|owner| owner.agent_index == agent.index)
+                {
+                    self.session_owners.remove(&scope);
+                }
+                self.held_since.remove(&scope);
+            }
+            return self.agents[idx].take();
+        }
+        None
+    }
+
+    /// Claim a worker for low-priority heartbeat work without evicting a
+    /// resident session.
+    ///
+    /// A heartbeat may reuse the worker that already holds its own heartbeat
+    /// session (preserving that conversation's identity across ticks) or any
+    /// worker with a free remote-session slot, including pending closes the
+    /// task will flush before its next `session/new`. When no worker can
+    /// accept a heartbeat session, return `None` so the caller skips this
+    /// tick and retries on the next heartbeat — evicting a live user
+    /// conversation to run heartbeat work is not allowed.
+    pub(crate) fn try_claim_heartbeat(&mut self) -> Option<OwnedAgent> {
+        // Pass 1: reuse the worker that already holds the heartbeat's own
+        // session. It is not a user scope, so scope-based claims never
+        // reach it; only the heartbeat may take it.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_ref() else {
+                continue;
+            };
+            if agent.state.heartbeat_session.is_some() {
+                return self.agents[idx].take();
+            }
+        }
+
+        // Pass 2: free capacity or reclaimable pending closes. Never evict —
+        // a capacity-full worker keeps every resident session intact.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_ref() else {
+                continue;
+            };
+            if agent.can_create_session() || agent.acp.has_pending_session_closes() {
+                return self.agents[idx].take();
+            }
+        }
+        None
     }
 
     /// Return an agent to its slot after a task completes.
@@ -988,6 +1206,7 @@ impl AgentPool {
                 scope = %scope.telemetry_label(),
                 "discarding stale session after ownership changed"
             );
+            agent.queue_scope_close_for_invalidation(&scope);
             agent.state.invalidate_scope(&scope);
         }
         let live_scopes: HashSet<SessionScope> = agent.state.sessions.keys().cloned().collect();
@@ -1217,6 +1436,16 @@ impl AgentPool {
         let mut count = 0;
         for slot in &mut self.agents {
             if let Some(agent) = slot.as_mut() {
+                let session_ids: Vec<String> = agent
+                    .state
+                    .sessions
+                    .iter()
+                    .filter(|(scope, _)| scope.channel_id() == channel_id)
+                    .map(|(_, session_id)| session_id.clone())
+                    .collect();
+                for session_id in session_ids {
+                    agent.queue_session_close_for_invalidation(&session_id);
+                }
                 // Channel-wide: clears every child thread scope for the channel.
                 count += agent.state.invalidate_channel(&channel_id);
             }
@@ -1245,6 +1474,7 @@ impl AgentPool {
         let mut count = 0;
         for slot in &mut self.agents {
             if let Some(agent) = slot.as_mut() {
+                agent.queue_scope_close_for_invalidation(scope);
                 if agent.state.invalidate_scope(scope) {
                     count += 1;
                 }
@@ -1336,10 +1566,12 @@ impl AgentPool {
         // Carry the pick's correlator so a deferred-validation miss on the next
         // turn's session creation emits a late frame the Desktop can match.
         agent.desired_model_request_id = request_id;
+        agent.queue_scope_close_for_invalidation(&scope);
         agent.state.invalidate_scope(&scope);
         self.session_owners.remove(&scope);
         self.held_since.remove(&scope);
-        IdleSwitchResult::Switched
+        agent.desired_model_pending_ack = true;
+        IdleSwitchResult::Pending
     }
 }
 
@@ -1368,8 +1600,9 @@ pub enum HoldDecision {
 pub enum IdleSwitchResult {
     /// More than one session scope belongs to this channel; nothing changed.
     AmbiguousTarget,
-    /// `desired_model` set and the selected session invalidated.
-    Switched,
+    /// `desired_model` set and the selected session invalidated. The terminal
+    /// success is emitted only after the replacement session applies it.
+    Pending,
     /// Desired model is not in the agent's cached catalog — pick rejected,
     /// session untouched.
     UnsupportedModel,
@@ -1537,7 +1770,14 @@ async fn create_session_and_apply_model(
                         "Goose does not support its system-prompt extension; using user-message framing"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(close_new_session_after_setup_failure(
+                        agent,
+                        &resp.session_id,
+                        error,
+                    )
+                    .await)
+                }
             }
         }
     }
@@ -1572,8 +1812,28 @@ async fn create_session_and_apply_model(
         let pending_ack = std::mem::take(&mut agent.desired_model_pending_ack);
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
-                match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?
-                {
+                let switch_result =
+                    match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            // Keep the deferred pick armed across a failed
+                            // setup attempt. The replacement path is the
+                            // retry boundary; clearing this flag here would
+                            // leave Desktop without a correlated terminal
+                            // result if the next session is the one that
+                            // eventually applies the model.
+                            agent.desired_model_pending_ack = pending_ack;
+                            return Err(close_new_session_after_setup_failure(
+                                agent,
+                                &resp.session_id,
+                                error,
+                            )
+                            .await);
+                        }
+                    };
+                match switch_result {
                     ModelSwitchOutcome::Applied(switch_result) => {
                         // The adapter rebuilds `session.configOptions` for the
                         // target model and echoes them here. Refresh capabilities
@@ -1672,7 +1932,13 @@ async fn create_session_and_apply_model(
     // the session is actually running; computed BEFORE the capture emission so
     // the cached configOptions tell the truth about the running session.
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
-    let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
+    let effort_outcome = match apply_startup_effort(agent, effort_snapshot, &resp.session_id).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(close_new_session_after_setup_failure(agent, &resp.session_id, error).await)
+        }
+    };
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -1723,7 +1989,13 @@ async fn create_session_and_apply_model(
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        if let Err(error) =
+            apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await
+        {
+            return Err(
+                close_new_session_after_setup_failure(agent, &resp.session_id, error).await,
+            );
+        }
     }
 
     Ok(resp.session_id)
@@ -2319,6 +2591,26 @@ pub async fn run_prompt_task(
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
 
+    // Pool-control invalidation queues remote closes because it cannot await
+    // the ACP stream. A checked-out task is the bounded async seam that owns
+    // this connection, so release those sessions before any new session/new.
+    // The supervisor never awaits this RPC directly.
+    if let Err(error) = agent.acp.close_pending_sessions().await {
+        tracing::error!(
+            target: "pool::session",
+            "failed to release pending session before prompt: {error}"
+        );
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            requeue_batch_if_queue(&ctx, batch),
+        );
+        return;
+    }
+
     // Resolve project authority exactly once, before any ACP session creation or
     // initial-message delivery. An indeterminate result is a local relay-state
     // outcome: fail closed and preserve the batch without poisoning the healthy
@@ -2733,6 +3025,23 @@ pub async fn run_prompt_task(
                                 Some(acp_stop_to_core(&stop_reason)),
                             )
                             .await;
+                            if let Err(error) =
+                                close_session_before_invalidation(&mut agent, &session_id).await
+                            {
+                                tracing::error!(
+                                    target: "pool::session",
+                                    "failed to release timed-out initial session: {error}"
+                                );
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::Error(error),
+                                    requeue_batch_if_queue(&ctx, batch),
+                                );
+                                return;
+                            }
                             agent.state.invalidate(&source);
                         }
                         Err(AcpError::AgentExited) => {
@@ -2788,13 +3097,27 @@ pub async fn run_prompt_task(
                         target: "pool::session",
                         "initial_message failed for channel {cid}: {e} — invalidating session"
                     );
-                    agent.state.invalidate(&source);
+                    let error = match close_session_before_invalidation(&mut agent, &session_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            agent.state.invalidate(&source);
+                            e
+                        }
+                        Err(cleanup) => {
+                            tracing::error!(
+                                target: "pool::session",
+                                "failed to release session after initial_message error: {cleanup}"
+                            );
+                            combine_cleanup_error(e, cleanup)
+                        }
+                    };
                     send_prompt_result(
                         &result_tx,
                         &turn_id,
                         agent,
                         source,
-                        PromptOutcome::Error(e),
+                        PromptOutcome::Error(error),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                     return;
@@ -3032,7 +3355,6 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -3046,6 +3368,24 @@ pub async fn run_prompt_task(
                                     Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
                                 )
                                 .await;
+                                if let Err(error) =
+                                    close_session_before_invalidation(&mut agent, &session_id).await
+                                {
+                                    tracing::error!(
+                                        target: "pool::session",
+                                        "failed to release cancelled session: {error}"
+                                    );
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        PromptOutcome::Error(error),
+                                        retry_batch,
+                                    );
+                                    return;
+                                }
+                                agent.state.invalidate(&source);
                                 send_prompt_result(
                                     &result_tx,
                                     &turn_id,
@@ -3057,20 +3397,40 @@ pub async fn run_prompt_task(
                                 return;
                             }
                             Err(error) => {
-                                // Single production arm: classify the error→outcome
-                                // and outcome→batch-fate boundary once via the seam
-                                // shared with tests, then invalidate/publish/send once.
+                                // Single production arm: retain the moved primary via
+                                // the seam shared with tests, then build the
+                                // PromptOutcome only after the cleanup branch so a
+                                // failed bounded session-close cannot replace the
+                                // original cancellation/drain failure.
                                 let failure = classify_control_cancel_failure(
                                     &ctx,
                                     error,
                                     control_signal,
                                     batch,
                                 );
-                                if failure.invalidate_all {
+                                let outcome = if failure.invalidate_all {
                                     agent.state.invalidate_all();
+                                    cancel_failure_outcome(failure.primary)
                                 } else {
-                                    agent.state.invalidate(&source);
-                                }
+                                    match close_session_before_invalidation(&mut agent, &session_id)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            agent.state.invalidate(&source);
+                                            cancel_failure_outcome(failure.primary)
+                                        }
+                                        Err(cleanup) => {
+                                            tracing::error!(
+                                                target: "pool::session",
+                                                "failed to release session after cancellation error: {cleanup}"
+                                            );
+                                            PromptOutcome::Error(combine_cleanup_error(
+                                                failure.primary,
+                                                cleanup,
+                                            ))
+                                        }
+                                    }
+                                };
 
                                 let usage = agent.acp.take_turn_usage();
                                 publish_agent_turn_metric(
@@ -3087,7 +3447,7 @@ pub async fn run_prompt_task(
                                     &turn_id,
                                     agent,
                                     source,
-                                    failure.outcome,
+                                    outcome,
                                     failure.retry_batch,
                                 );
                                 return;
@@ -3131,6 +3491,38 @@ pub async fn run_prompt_task(
                                 standing_sent,
                                 &pending_delivered_event_ids,
                             );
+                        }
+                        if matches!(
+                            control_signal,
+                            ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
+                        ) {
+                            if let Err(error) =
+                                close_session_before_invalidation(&mut agent, &session_id).await
+                            {
+                                tracing::error!(
+                                    target: "pool::session",
+                                    "failed to release completed session before rotate/switch: {error}"
+                                );
+                                let usage = agent.acp.take_turn_usage();
+                                publish_agent_turn_metric(
+                                    &ctx,
+                                    usage,
+                                    observer_channel_id,
+                                    &session_id,
+                                    &turn_id,
+                                    Some(buzz_core::agent_turn_metric::StopReason::Error),
+                                )
+                                .await;
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::Error(error),
+                                    None,
+                                );
+                                return;
+                            }
                         }
                         apply_completed_before_control_signal(
                             &mut agent.state,
@@ -3207,6 +3599,32 @@ pub async fn run_prompt_task(
                     target: "pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
+                if let Err(error) = close_session_before_invalidation(&mut agent, &session_id).await
+                {
+                    tracing::error!(
+                        target: "pool::session",
+                        "failed to release rotated session: {error}"
+                    );
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(error),
+                        None,
+                    );
+                    return;
+                }
                 agent.state.invalidate(&source);
             }
 
@@ -3372,8 +3790,18 @@ pub async fn run_prompt_task(
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
-                agent.state.invalidate(&source);
+            let mut prompt_error = e;
+            if !matches!(&prompt_error, AcpError::AgentError { .. }) {
+                match close_session_before_invalidation(&mut agent, &session_id).await {
+                    Ok(()) => agent.state.invalidate(&source),
+                    Err(cleanup) => {
+                        tracing::error!(
+                            target: "pool::session",
+                            "failed to release session after prompt error: {cleanup}"
+                        );
+                        prompt_error = combine_cleanup_error(prompt_error, cleanup);
+                    }
+                }
             }
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
@@ -3390,7 +3818,7 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
-                PromptOutcome::Error(e),
+                PromptOutcome::Error(prompt_error),
                 requeue_batch_if_queue(&ctx, batch),
             );
         }
@@ -4605,11 +5033,15 @@ fn requeue_cancelled_batch(
 }
 
 /// Result of classifying a failed [`AcpClient::cancel_with_cleanup_grace`]
-/// call: the [`PromptOutcome`] to report and the triggering batch's fate,
+/// call: the retained primary failure and the triggering batch's fate,
 /// decided together so tests cross the exact error→outcome→batch-fate
-/// boundary the production `Err(error)` arm uses.
+/// boundary the production `Err(error)` arm uses. The primary is retained by
+/// move (it is not `Clone`) so a later bounded session-close cleanup failure
+/// can be combined with it instead of replacing it in the reported outcome.
 struct ControlCancelFailure {
-    outcome: PromptOutcome,
+    /// Original cancellation/drain failure, retained by move for the
+    /// production arm to map or combine with a cleanup failure.
+    primary: AcpError,
     retry_batch: Option<FlushBatch>,
     /// `AgentExited` invalidates every session on the agent; every other
     /// failure invalidates only the source that triggered this turn.
@@ -4617,10 +5049,16 @@ struct ControlCancelFailure {
 }
 
 /// Classify a failed control-signal cancellation (steer fallback, interrupt,
-/// or explicit stop) into the [`PromptOutcome`] to report and the triggering
+/// or explicit stop) into the retained primary failure and the triggering
 /// batch's fate. This is the single production seam used by the `Err(error)`
 /// arm of the control-cancel branch in [`run_prompt_task`] — the boundary
 /// this exists to keep singular, so regressions there are regression-tested.
+///
+/// The [`PromptOutcome`] is deliberately built by the production arm only
+/// after the bounded session-close cleanup branch: successful cleanup maps
+/// the primary through [`cancel_failure_outcome`], failed cleanup combines it
+/// through [`combine_cleanup_error`]. Neither path can silently drop the
+/// original failure.
 ///
 /// [`AcpError::CancelDrainTimeout`] is the expected, common case: the agent
 /// didn't stop within its bounded grace window. [`AcpError::HardTimeout`] is
@@ -4628,33 +5066,40 @@ struct ControlCancelFailure {
 /// own drain-deadline `HardTimeout` into `CancelDrainTimeout` before
 /// returning — but for defense in depth an unexpected `HardTimeout` at this
 /// bounded cancellation boundary must never regain real hard-cap/dead-letter
-/// classification, so it maps to `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`
-/// rather than `Timeout(Hard)`.
+/// classification, so [`cancel_failure_outcome`] maps it to
+/// `CancelDrainTimeout(CONTROL_CANCEL_GRACE)` rather than `Timeout(Hard)`.
 fn classify_control_cancel_failure(
     ctx: &PromptContext,
     error: AcpError,
     signal: ControlSignal,
     batch: Option<FlushBatch>,
 ) -> ControlCancelFailure {
-    let (outcome, invalidate_all) = match error {
-        AcpError::AgentExited => (PromptOutcome::AgentExited, true),
-        AcpError::IdleTimeout(_) => (PromptOutcome::Timeout(TimeoutKind::Idle), false),
-        AcpError::CancelDrainTimeout(grace) => (PromptOutcome::CancelDrainTimeout(grace), false),
+    let invalidate_all = matches!(error, AcpError::AgentExited);
+    ControlCancelFailure {
+        primary: error,
+        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
+        invalidate_all,
+    }
+}
+
+/// Map a retained cancellation/drain failure to the [`PromptOutcome`]
+/// reported when the bounded session-close cleanup succeeds (or is a no-op
+/// on unbounded connections). This keeps the error→outcome boundary
+/// singular: an unexpected [`AcpError::HardTimeout`] maps to
+/// `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`, never `Timeout(Hard)`, so it
+/// cannot dead-letter the batch or claim the configured cap.
+fn cancel_failure_outcome(primary: AcpError) -> PromptOutcome {
+    match primary {
+        AcpError::AgentExited => PromptOutcome::AgentExited,
+        AcpError::IdleTimeout(_) => PromptOutcome::Timeout(TimeoutKind::Idle),
+        AcpError::CancelDrainTimeout(grace) => PromptOutcome::CancelDrainTimeout(grace),
         // Defense in depth: this bounded cancellation API is documented to
         // translate its own HardTimeout into CancelDrainTimeout, so this arm
         // should be unreachable in practice. If it ever fires anyway, still
         // report the truthful non-hard outcome rather than the real hard-cap
         // (which would dead-letter the batch and claim the configured cap).
-        AcpError::HardTimeout { .. } => (
-            PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
-            false,
-        ),
-        other => (PromptOutcome::Error(other), false),
-    };
-    ControlCancelFailure {
-        outcome,
-        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
-        invalidate_all,
+        AcpError::HardTimeout { .. } => PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+        other => PromptOutcome::Error(other),
     }
 }
 
@@ -7661,6 +8106,177 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         agent
     }
 
+    async fn hanging_close_agent(index: usize) -> OwnedAgent {
+        let mut acp = AcpClient::spawn(
+            "bash",
+            &[
+                "-c".into(),
+                r#"
+                read -r initialize
+                printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}'
+                read -r close
+                sleep 60
+                "#
+                .into(),
+            ],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn hanging-close ACP");
+        acp.initialize()
+            .await
+            .expect("initialize hanging-close ACP");
+        acp.set_max_sessions_per_connection(Some(1));
+        acp.queue_session_close("stale-session");
+        OwnedAgent {
+            index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hanging_session_closes_are_worker_owned_and_shutdown_abortable() {
+        // The production dispatch path owns this fallible close inside a
+        // per-worker `run_prompt_task`; two stalled closes therefore cannot
+        // serialize in the supervisor. The independent future models relay or
+        // maintenance work, while abort models bounded shutdown cancellation.
+        let ctx = Arc::new(make_prompt_context_no_owner());
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let task_a = tokio::spawn(run_prompt_task(
+            hanging_close_agent(0).await,
+            None,
+            Some("prompt-a".into()),
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "close-a".into(),
+        ));
+        let task_b = tokio::spawn(run_prompt_task(
+            hanging_close_agent(1).await,
+            None,
+            Some("prompt-b".into()),
+            ctx,
+            result_tx,
+            None,
+            "close-b".into(),
+        ));
+
+        let independent = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        tokio::time::timeout(Duration::from_millis(250), independent)
+            .await
+            .expect("a stalled close must not block an independent lifecycle task")
+            .expect("independent lifecycle task must run");
+        assert!(
+            result_rx.try_recv().is_err(),
+            "stalled workers remain in flight"
+        );
+
+        task_a.abort();
+        task_b.abort();
+        tokio::time::timeout(Duration::from_millis(250), task_a)
+            .await
+            .expect("first stalled worker must abort promptly")
+            .expect_err("aborted worker should report cancellation");
+        tokio::time::timeout(Duration::from_millis(250), task_b)
+            .await
+            .expect("second stalled worker must abort promptly")
+            .expect_err("aborted worker should report cancellation");
+    }
+
+    #[tokio::test]
+    async fn bounded_idle_worker_evicts_for_independent_scope_instead_of_starving() {
+        let scope_a = conv(Uuid::new_v4());
+        let scope_b = conv(Uuid::new_v4());
+        let mut agent = idle_agent_with_session(0, scope_a.clone()).await;
+        agent.acp.set_max_sessions_per_connection(Some(1));
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(scope_a.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("idle worker")
+            .state
+            .set_scope_owner_generation(scope_a.clone(), generation);
+
+        let claimed = pool
+            .try_claim(Some(&scope_b))
+            .expect("independent scope must make progress");
+        assert_eq!(claimed.index, 0);
+        assert!(!claimed.state.sessions.contains_key(&scope_a));
+        assert!(claimed.acp.has_pending_session_closes());
+        assert!(
+            !pool.session_owners.contains_key(&scope_a),
+            "eviction must remove the stale scope owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_idle_worker_preserves_exact_scope_affinity() {
+        let scope_a = conv(Uuid::new_v4());
+        let mut agent = idle_agent_with_session(0, scope_a.clone()).await;
+        agent.acp.set_max_sessions_per_connection(Some(1));
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(scope_a.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("idle worker")
+            .state
+            .set_scope_owner_generation(scope_a.clone(), generation);
+
+        let claimed = pool
+            .try_claim(Some(&scope_a))
+            .expect("affine scope must reuse its resident session");
+        assert_eq!(
+            claimed.state.sessions.get(&scope_a).map(String::as_str),
+            Some("sess")
+        );
+        assert!(!claimed.acp.has_pending_session_closes());
+    }
+
+    #[tokio::test]
+    async fn bounded_capacity_two_evicts_one_resident_scope_for_a_third() {
+        let scope_a = conv(Uuid::new_v4());
+        let scope_b = conv(Uuid::new_v4());
+        let scope_c = conv(Uuid::new_v4());
+        let mut agent = idle_agent_with_session(0, scope_a.clone()).await;
+        agent
+            .state
+            .sessions
+            .insert(scope_b.clone(), "sess-b".into());
+        agent.acp.set_max_sessions_per_connection(Some(2));
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        for scope in [&scope_a, &scope_b] {
+            let generation = pool.record_scope_owner(scope.clone(), 0);
+            pool.agents[0]
+                .as_mut()
+                .expect("idle worker")
+                .state
+                .set_scope_owner_generation(scope.clone(), generation);
+        }
+
+        let claimed = pool
+            .try_claim(Some(&scope_c))
+            .expect("third scope must make progress at capacity two");
+        assert_eq!(claimed.state.sessions.len(), 1);
+        assert!(claimed.acp.has_pending_session_closes());
+        assert!(
+            pool.session_owners.len() <= 1,
+            "eviction removes exactly the evicted scope's owner"
+        );
+    }
+
     // `hold_decision` is gated on the scope variant (not session policy),
     // short-circuits when an idle worker already holds the session or no busy
     // owner is recorded, and only a busy `Thread` owner holds — for a bounded
@@ -8343,7 +8959,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 case.signal.clone(),
                 Some(batch),
             );
-            assert_outcome_matches(&failure.outcome, case.expected_outcome);
+            assert_outcome_matches(
+                &cancel_failure_outcome(failure.primary),
+                case.expected_outcome,
+            );
             assert_eq!(
                 failure.invalidate_all, case.invalidate_all,
                 "{}: invalidate_all mismatch",
@@ -10257,6 +10876,460 @@ done"#
         );
         server.abort();
     }
+
+    // ── R2: heartbeats must never evict resident user conversations ────────
+    //
+    // These witnesses drive the real `crate::dispatch_heartbeat` production
+    // seam against a scripted ACP adapter that captures every wire request,
+    // so the assertions hold on actual `session/new`, `session/close`, and
+    // `session/prompt` traffic — not only in-memory bookkeeping.
+
+    /// Scripted ACP adapter that appends every received request to `capture`.
+    /// Responses are deterministic: initialize advertises close, session/new
+    /// returns `sess-<request-id>`, session/close is a no-op, and prompt ends
+    /// with `end_turn`. Each response id is parsed from the request line
+    /// itself, so the adapter tracks the client's real JSON-RPC id sequence
+    /// instead of assuming one request per line.
+    async fn r2_witness_adapter(capture: &std::path::Path) -> AcpClient {
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{{"close":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"sess-%s"}}}}\n' "$id" "$id" ;;
+    *'"method":"session/close"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id" ;;
+  esac
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn R2 witness ACP script")
+    }
+
+    fn r2_witness_agent(client: AcpClient) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp: client,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "r2-witness-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Wait for the single result the dispatched prompt task sends on
+    /// completion, then drain the channel. The result is the task's terminal
+    /// action, so once it is in hand the turn's wire traffic is fully captured.
+    async fn r2_settle_results(pool: &mut AgentPool, budget: Duration) -> Vec<PromptResult> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut results = Vec::new();
+        loop {
+            match pool.result_rx_try_recv() {
+                Ok(result) => {
+                    results.push(result);
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        while let Ok(result) = pool.result_rx_try_recv() {
+            results.push(result);
+        }
+        results
+    }
+
+    fn r2_read_wire(capture: &std::path::Path) -> String {
+        let wire = std::fs::read_to_string(capture).expect("wire capture written");
+        let _ = std::fs::remove_file(capture);
+        wire
+    }
+
+    fn r2_count_method(wire: &str, method: &str) -> usize {
+        wire.lines()
+            .filter(|line| line.contains(&format!("\"method\":\"{method}\"")))
+            .count()
+    }
+
+    /// R2 witness: at capacity one, with one worker holding one live user
+    /// conversation, a heartbeat tick must skip — leaving the conversation
+    /// owned, spawning no task, and sending no session/close or second
+    /// session/new on the wire.
+    #[tokio::test]
+    async fn heartbeat_at_capacity_one_skips_instead_of_evicting_live_conversation() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-skip-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let user_scope = conv(Uuid::new_v4());
+        let mut agent = r2_witness_agent(client);
+        agent.state.sessions.insert(user_scope.clone(), user_sid);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(user_scope.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(user_scope.clone(), generation);
+        assert!(
+            pool.has_session_for(&user_scope),
+            "setup: the resident session must be claimable by its scope"
+        );
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+
+        // The skip decision is synchronous: if the tick was skipped, no task
+        // was spawned, so in-flight state and wire state are final right now.
+        assert!(
+            !in_flight,
+            "skipped tick must leave heartbeat_in_flight clear"
+        );
+        assert!(
+            pool.task_map().is_empty(),
+            "skipped tick must not spawn a prompt task"
+        );
+        assert!(
+            pool.has_session_for(&user_scope),
+            "the live conversation must stay owned by its worker after a skipped tick"
+        );
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat opened a second session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "heartbeat closed the user session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            0,
+            "heartbeat sent a prompt: {wire}"
+        );
+    }
+
+    /// R2 witness: a heartbeat that already owns a session at full capacity
+    /// must keep prompting in that exact session — no rotation, no close —
+    /// instead of evicting its way to a fresh slot.
+    #[tokio::test]
+    async fn heartbeat_reuses_resident_heartbeat_session_at_full_capacity() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-reuse-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+
+        let mut pool = AgentPool::from_slots(vec![Some(r2_witness_agent(client))]);
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        // Tick 1: free capacity — the heartbeat creates its own session.
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "free-capacity tick must run");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "first heartbeat must complete");
+        let first = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(first.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = first
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("first heartbeat records its session");
+        pool.return_agent(first.agent);
+        // The production supervisor clears this flag while consuming the
+        // completed heartbeat result. The witness consumes the result
+        // directly, so mirror that state transition before the next tick.
+        in_flight = false;
+
+        // Tick 2: full capacity — the heartbeat must reuse its own session
+        // instead of rotating it (and certainly not evict anything).
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(
+            in_flight,
+            "full-capacity tick must run on the worker holding the heartbeat session"
+        );
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "second heartbeat must complete");
+        let second = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(second.outcome, PromptOutcome::Ok(_)));
+        assert_eq!(
+            second.agent.state.heartbeat_session,
+            Some(hb_sid.clone()),
+            "heartbeat session identity must not rotate at full capacity"
+        );
+        pool.return_agent(second.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat rotated its own session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "heartbeat closed its own live session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            2,
+            "each tick must prompt: {wire}"
+        );
+    }
+
+    /// Control: with free capacity the heartbeat still runs — the skip must
+    /// only kick in at the capacity limit.
+    #[tokio::test]
+    async fn heartbeat_with_free_capacity_still_runs() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-free-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+
+        let mut pool = AgentPool::from_slots(vec![Some(r2_witness_agent(client))]);
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "free-capacity tick must run");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "heartbeat must complete");
+        let first = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(first.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = first
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("heartbeat session recorded");
+        assert!(!hb_sid.is_empty());
+        pool.return_agent(first.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat must create its session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "no close expected: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            1,
+            "heartbeat must prompt: {wire}"
+        );
+    }
+
+    /// R2 witness: a skipped tick must not poison the schedule. After the
+    /// skipped tick, user work on the resident scope still claims and reuses
+    /// its session, and once the channel is removed the heartbeat runs on the
+    /// freed worker.
+    #[tokio::test]
+    async fn skipped_heartbeat_tick_does_not_poison_scheduling() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-no-poison-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let user_scope = conv(Uuid::new_v4());
+        let channel_id = user_scope.channel_id();
+        let mut agent = r2_witness_agent(client);
+        agent
+            .state
+            .sessions
+            .insert(user_scope.clone(), user_sid.clone());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(user_scope.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(user_scope.clone(), generation);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        // Tick 1: full capacity → skip; the conversation survives.
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(!in_flight, "tick 1 must skip at full capacity");
+        assert!(pool.task_map().is_empty(), "tick 1 must not spawn a task");
+        assert!(
+            pool.has_session_for(&user_scope),
+            "user conversation must survive the skipped tick"
+        );
+
+        // User work on the same scope still functions: the claim reuses the
+        // resident session, evicting nothing.
+        let claimed = pool
+            .try_claim(Some(&user_scope))
+            .expect("user work must claim the worker");
+        assert_eq!(
+            claimed.state.sessions.get(&user_scope),
+            Some(&user_sid),
+            "user turn must reuse the resident session"
+        );
+        pool.return_agent(claimed);
+        assert!(
+            pool.has_session_for(&user_scope),
+            "user session must survive the user turn"
+        );
+
+        // Channel removal frees the capacity through the production
+        // invalidation seam: the session is invalidated and its close queued
+        // for the next session/new to flush.
+        let invalidated = pool.invalidate_channel_sessions(channel_id);
+        assert_eq!(
+            invalidated, 1,
+            "channel removal must invalidate the resident session"
+        );
+
+        // Tick 2: the skipped tick must not have poisoned the schedule — the
+        // heartbeat now runs on the freed worker.
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "tick 2 must run once capacity is free");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(
+            results.len(),
+            1,
+            "heartbeat must complete after capacity frees"
+        );
+        let second = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(second.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = second
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("heartbeat session recorded");
+        assert_ne!(
+            hb_sid, user_sid,
+            "heartbeat must not squat in the user session"
+        );
+        pool.return_agent(second.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            2,
+            "user + heartbeat sessions only: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            1,
+            "the invalidated user session is closed exactly once: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            1,
+            "heartbeat prompt only: {wire}"
+        );
+    }
+
+    /// Control: the R2 change must not weaken legitimate user-work eviction.
+    /// A claim for a different scope at full capacity still evicts the
+    /// resident session and queues its remote close.
+    #[tokio::test]
+    async fn user_claim_still_evicts_resident_session_at_capacity_one() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-user-evict-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let scope_a = conv(Uuid::new_v4());
+        let mut agent = r2_witness_agent(client);
+        agent.state.sessions.insert(scope_a.clone(), user_sid);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(scope_a.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(scope_a.clone(), generation);
+
+        let scope_b = conv(Uuid::new_v4());
+        let claimed = pool
+            .try_claim(Some(&scope_b))
+            .expect("user work must claim a worker at full capacity");
+        assert!(
+            !claimed.state.sessions.contains_key(&scope_a),
+            "resident session must be evicted for user work"
+        );
+        assert!(
+            claimed.acp.has_pending_session_closes(),
+            "evicted session must be queued for remote close"
+        );
+        assert!(!pool.any_idle(), "the worker is checked out");
+    }
 }
 
 #[cfg(test)]
@@ -10731,7 +11804,7 @@ done"#
             .insert(scopes[0].clone(), tokio::time::Instant::now());
         assert_eq!(
             pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into())),
-            IdleSwitchResult::Switched,
+            IdleSwitchResult::Pending,
         );
         let agent = pool.agents[0].as_ref().unwrap();
         assert_eq!(agent.desired_model.as_deref(), Some("model-b"));
@@ -10739,7 +11812,14 @@ done"#
         assert!(!pool.session_owners.contains_key(&scopes[0]));
         assert!(
             !pool.held_since.contains_key(&scopes[0]),
-            "switched scope's hold stamp cleared with its session"
+            "pending switch scope's hold stamp cleared with its session"
+        );
+        assert!(
+            pool.agents[0]
+                .as_ref()
+                .expect("idle worker")
+                .desired_model_pending_ack,
+            "idle switch success must remain pending until replacement setup applies it"
         );
     }
 
@@ -10915,6 +11995,52 @@ done"#
             !agent.desired_model_pending_ack,
             "the pending-ack is consumed even on rejection so it cannot re-fire"
         );
+    }
+
+    #[tokio::test]
+    async fn test_busy_path_transport_failure_restores_pending_ack_for_replacement() {
+        // A dead adapter after session/new is a transport failure, not an
+        // application-level model rejection. The replacement must retain the
+        // deferred pick so its first successful session can emit the
+        // correlated terminal result.
+        let script = format!(
+            r#"read -r _session
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{OPTS_MODEL_A_AND_B}}}}}'
+read -r _switch
+exit 0"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn transport-failure ACP script");
+        let mut agent = switching_agent(acp, "model-b");
+        agent.desired_model_pending_ack = true;
+        agent.desired_model_request_id = Some("req-transport-failure".into());
+
+        let ctx = make_prompt_context_no_owner();
+        let result = create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: None,
+                channel_type: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcpError::AgentExited)));
+        assert!(
+            agent.desired_model_pending_ack,
+            "a transport failure must leave the deferred pick armed for replacement"
+        );
+        assert_eq!(
+            agent.desired_model_request_id.as_deref(),
+            Some("req-transport-failure")
+        );
+        agent.acp.shutdown().await;
     }
 
     #[tokio::test]
@@ -11212,5 +12338,283 @@ done"#
             cap["configOptions"].is_null(),
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+    use crate::acp::{AcpClient, AcpError};
+    use crate::{acp_error_requires_connection_replacement, is_planned_connection_retirement};
+    use tests::make_prompt_context_no_owner;
+
+    /// Build a Goose-shaped ACP worker whose system-prompt setup fails after
+    /// `session/new`. The close capability and close response are varied so
+    /// this exercises the production setup-cleanup seam, not only the error
+    /// formatter.
+    async fn setup_failure_agent(
+        close_advertised: bool,
+        close_response: Option<&str>,
+    ) -> OwnedAgent {
+        let initialize = if close_advertised {
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#
+        };
+        let close_response = close_response.unwrap_or("");
+        let script = r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '__INITIALIZE__'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"sess-1"}}'
+  elif [ "$count" -eq 3 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"system prompt setup failed"}}'
+  elif [ "$count" -eq 4 ]; then
+    printf '%s\n' '__CLOSE_RESPONSE__'
+  fi
+done"#
+            .replace("__INITIALIZE__", initialize)
+            .replace("__CLOSE_RESPONSE__", close_response);
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn setup-failure ACP");
+        acp.initialize()
+            .await
+            .expect("initialize setup-failure ACP");
+        acp.set_max_sessions_per_connection(Some(1));
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "goose".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    async fn run_setup_failure_case(
+        close_advertised: bool,
+        close_response: Option<&str>,
+    ) -> (OwnedAgent, AcpError) {
+        let mut agent = setup_failure_agent(close_advertised, close_response).await;
+        let mut context = make_prompt_context_no_owner();
+        context.system_prompt = Some("setup prompt".into());
+        let error = create_session_and_apply_model(
+            &mut agent,
+            &context,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: None,
+                channel_type: None,
+            },
+        )
+        .await
+        .expect_err("the scripted Goose system-prompt setup must fail");
+        (agent, error)
+    }
+
+    #[tokio::test]
+    async fn setup_failure_with_successful_close_preserves_primary_error() {
+        let (mut agent, error) =
+            run_setup_failure_case(true, Some(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#)).await;
+        assert!(matches!(
+            &error,
+            AcpError::AgentError { code: -32001, message }
+                if message.contains("system prompt setup failed")
+        ));
+        assert_eq!(agent.acp.live_session_count(), 0);
+        assert!(!agent.acp.has_pending_session_closes());
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_failure_with_failed_close_preserves_both_errors() {
+        let (mut agent, error) = run_setup_failure_case(
+            true,
+            Some(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"close failed"}}"#),
+        )
+        .await;
+        let display = error.to_string();
+        assert!(display.contains("system prompt setup failed"));
+        assert!(display.contains("close failed"));
+        assert!(matches!(error, AcpError::SetupAndCleanupFailed { .. }));
+        assert!(is_planned_connection_retirement(&error));
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_failure_with_unsupported_close_is_not_reused() {
+        let (mut agent, error) = run_setup_failure_case(false, None).await;
+        let display = error.to_string();
+        assert!(display.contains("system prompt setup failed"));
+        assert!(display.contains("cannot release session sess-1"));
+        assert!(matches!(error, AcpError::SetupAndCleanupFailed { .. }));
+        assert!(is_planned_connection_retirement(&error));
+        agent.acp.shutdown().await;
+    }
+
+    /// Drive the production control-cancel `Err` arm end to end: the prompt
+    /// never completes, the bounded `session/close` fails, and the reported
+    /// outcome must carry both the original drain failure and the cleanup
+    /// failure instead of the cleanup error alone.
+    #[tokio::test]
+    async fn control_cancel_close_failure_preserves_primary_and_cleanup() {
+        let marker =
+            std::env::temp_dir().join(format!("buzz-acp-cancel-drain-{}.marker", Uuid::new_v4()));
+        let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{"sessionCapabilities":{{"close":{{}}}}}}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    : # session/prompt: leave in flight — the drain must expire
+    touch '{quoted_marker}'
+  elif [ "$count" -eq 3 ]; then
+    : # session/cancel is a notification — no response
+  elif [ "$count" -eq 4 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32002,"message":"close failed"}}}}'
+  fi
+done"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn drain-timeout ACP script");
+        acp.initialize()
+            .await
+            .expect("initialize drain-timeout ACP");
+        acp.set_max_sessions_per_connection(Some(1));
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "drain-timeout-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent.state.heartbeat_session = Some("sess-1".into());
+
+        let ctx = Arc::new(make_prompt_context_no_owner());
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+        let task = tokio::spawn(run_prompt_task(
+            agent,
+            None,
+            Some("cancel me".to_string()),
+            Arc::clone(&ctx),
+            result_tx,
+            Some(control_rx),
+            "turn-cancel-drain".to_string(),
+        ));
+
+        // Wait until the prompt is provably at the agent before firing the
+        // cancel, so the in-flight guard cannot race the cancel branch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prompt never reached the scripted agent"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        control_tx
+            .send(ControlSignal::Cancel)
+            .expect("send cancel signal");
+
+        let mut result = result_rx.recv().await.expect("prompt result");
+        let PromptOutcome::Error(error) = &result.outcome else {
+            panic!("expected an Error outcome carrying both failures");
+        };
+        let display = error.to_string();
+        assert!(
+            display.contains("did not stop within"),
+            "primary drain failure must survive: {display}"
+        );
+        assert!(
+            display.contains("close failed"),
+            "cleanup failure must be recorded: {display}"
+        );
+        assert!(
+            matches!(error, AcpError::SetupAndCleanupFailed { .. }),
+            "both failures must be combined: {display}"
+        );
+        assert!(
+            is_planned_connection_retirement(error),
+            "a failed close after a drain timeout retires planned, not as a transport crash"
+        );
+        result.agent.acp.shutdown().await;
+        task.await.expect("prompt task joins");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// Seam witness: the classifier hands the moved primary to the production
+    /// arm, and the arm's nonfatal combine preserves both failures while
+    /// keeping the planned-retirement classification.
+    #[test]
+    fn control_cancel_failure_retains_nonfatal_primary_for_cleanup_combining() {
+        let failure = classify_control_cancel_failure(
+            &make_prompt_context_no_owner(),
+            AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+            ControlSignal::Cancel,
+            None,
+        );
+        assert!(!failure.invalidate_all);
+        let combined = combine_cleanup_error(
+            failure.primary,
+            AcpError::SessionCloseFailed {
+                source: Box::new(AcpError::AgentError {
+                    code: -32002,
+                    message: "close failed".to_string(),
+                }),
+            },
+        );
+        assert!(matches!(combined, AcpError::SetupAndCleanupFailed { .. }));
+        let display = combined.to_string();
+        assert!(display.contains("did not stop within"), "{display}");
+        assert!(display.contains("close failed"), "{display}");
+        assert!(is_planned_connection_retirement(&combined));
+        assert!(!acp_error_requires_connection_replacement(&combined));
+    }
+
+    /// Seam witness: a connection-fatal primary is reported as-is, so the
+    /// transport classification comes from the real crash, not the cleanup.
+    #[test]
+    fn control_cancel_cleanup_combine_keeps_connection_fatal_primary() {
+        let failure = classify_control_cancel_failure(
+            &make_prompt_context_no_owner(),
+            AcpError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin broken",
+            )),
+            ControlSignal::Cancel,
+            None,
+        );
+        let combined = combine_cleanup_error(
+            failure.primary,
+            AcpError::SessionCloseUnsupported {
+                session_id: "sess-1".to_string(),
+            },
+        );
+        assert!(matches!(combined, AcpError::Io(_)));
+        assert!(acp_error_requires_connection_replacement(&combined));
+        assert!(!is_planned_connection_retirement(&combined));
     }
 }

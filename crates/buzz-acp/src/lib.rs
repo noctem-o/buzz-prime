@@ -134,6 +134,71 @@ fn emit_runtime_lifecycle(
     }
 }
 
+fn emit_planned_replacement_failure(
+    observer: Option<&observer::ObserverHandle>,
+    agent_index: usize,
+    channel_id: Option<Uuid>,
+    replacement_state: &ReplacementState,
+    error: &anyhow::Error,
+) {
+    if !replacement_state.desired_model_pending_ack {
+        return;
+    }
+    let Some(observer) = observer else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "type": "switch_model",
+        "status": "failure",
+        "modelId": replacement_state.desired_model,
+        "requestId": replacement_state.desired_model_request_id,
+        "error": error.to_string(),
+    });
+    observer.emit(
+        "control_result",
+        Some(agent_index),
+        &observer::context_for(channel_id, None, None),
+        payload,
+    );
+}
+
+fn handle_respawn_failure(
+    slot: &mut SlotCircuit,
+    planned: bool,
+    observer: Option<&observer::ObserverHandle>,
+    agent_index: usize,
+    channel_id: Option<Uuid>,
+    replacement_state: Option<&ReplacementState>,
+    error: &anyhow::Error,
+) {
+    if planned {
+        if let Some(replacement_state) = replacement_state {
+            emit_planned_replacement_failure(
+                observer,
+                agent_index,
+                channel_id,
+                replacement_state,
+                error,
+            );
+        }
+        // A planned retirement does not represent a crash, so it must not
+        // charge crash_times. A failed replacement is still a failed spawn,
+        // however, and needs the same bounded cooldown as any other failed
+        // spawn so maintenance cannot retry it on every tick.
+        slot.mark_spawn_failed();
+        tracing::warn!(
+            agent = agent_index,
+            "planned replacement failed: {error} — spawn-failure circuit opened"
+        );
+    } else {
+        slot.mark_spawn_failed();
+        tracing::warn!(
+            agent = agent_index,
+            "respawn failed: {error} — circuit re-opened"
+        );
+    }
+}
+
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
@@ -1880,7 +1945,10 @@ fn handle_switch_model_control(
         // Idle path: validate against the cached catalog before invalidating.
         match pool.switch_idle_agent_model(channel_id, model_id, request_id.clone()) {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
-            IdleSwitchResult::Switched => "switched",
+            // The request was accepted but the replacement session has not
+            // applied it yet. Reuse the existing provisional wire status so
+            // older Desktop clients keep treating this as non-terminal.
+            IdleSwitchResult::Pending => "sent",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
         }
@@ -2042,8 +2110,50 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 }
 
 /// Result of a background respawn task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplacementState {
+    /// Runtime model selection to apply on the first session of the new
+    /// connection. Planned retirement is an ownership transition, not a
+    /// process restart, so a pending or already-applied live override must
+    /// survive it.
+    desired_model: Option<String>,
+    model_overridden: bool,
+    desired_model_request_id: Option<String>,
+    desired_model_pending_ack: bool,
+}
+
+impl ReplacementState {
+    fn from_agent(agent: &OwnedAgent) -> Self {
+        Self {
+            desired_model: agent.desired_model.clone(),
+            model_overridden: agent.model_overridden,
+            desired_model_request_id: agent.desired_model_request_id.clone(),
+            desired_model_pending_ack: agent.desired_model_pending_ack,
+        }
+    }
+
+    fn from_config(config: &Config) -> Self {
+        Self {
+            desired_model: config.model.clone(),
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+        }
+    }
+}
+
 struct RespawnResult {
     index: usize,
+    /// Planned retirements do not add adapter-crash history. A failed planned
+    /// spawn still opens the bounded spawn-failure cooldown.
+    planned: bool,
+    /// The channel that initiated a planned replacement, so a terminal
+    /// model-switch failure remains routable to the originating Desktop view.
+    channel_id: Option<Uuid>,
+    /// Planned replacement carries runtime-only model state across the
+    /// connection boundary. Crash/refill respawns intentionally use `None` so
+    /// a genuine process restart starts from current Config defaults.
+    replacement_state: Option<ReplacementState>,
     /// Tuple: (initialized client, protocol version, agent name).
     result: Result<(AcpClient, u32, String)>,
 }
@@ -2076,14 +2186,26 @@ struct SteerAckEvent {
 /// permanently, silently losing the slot forever.
 struct RespawnGuard {
     index: usize,
+    planned: bool,
+    channel_id: Option<Uuid>,
+    replacement_state: Option<ReplacementState>,
     tx: mpsc::Sender<RespawnResult>,
     sent: bool,
 }
 
 impl RespawnGuard {
-    fn new(index: usize, tx: mpsc::Sender<RespawnResult>) -> Self {
+    fn new(
+        index: usize,
+        planned: bool,
+        channel_id: Option<Uuid>,
+        replacement_state: Option<ReplacementState>,
+        tx: mpsc::Sender<RespawnResult>,
+    ) -> Self {
         Self {
             index,
+            planned,
+            channel_id,
+            replacement_state,
             tx,
             sent: false,
         }
@@ -2099,6 +2221,9 @@ impl RespawnGuard {
         // respawn_in_flight guard has drifted — that's a bug, not a transient.
         match self.tx.try_send(RespawnResult {
             index: self.index,
+            planned: self.planned,
+            channel_id: self.channel_id,
+            replacement_state: self.replacement_state.clone(),
             result,
         }) {
             Ok(()) => self.sent = true,
@@ -2123,6 +2248,9 @@ impl Drop for RespawnGuard {
             // Best-effort: try_send in Drop (can't await).
             let _ = self.tx.try_send(RespawnResult {
                 index: self.index,
+                planned: self.planned,
+                channel_id: self.channel_id,
+                replacement_state: self.replacement_state.clone(),
                 result: Err(anyhow::anyhow!("respawn task panicked or was cancelled")),
             });
         }
@@ -3065,10 +3193,13 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let max_sessions = config.max_sessions_per_connection;
                 let observer = observer.clone();
-                let guard = RespawnGuard::new(idx, respawn_tx.clone());
+                let guard = RespawnGuard::new(idx, false, None, None, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, has_codex, max_sessions, idx, observer)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -3093,30 +3224,46 @@ async fn tokio_main() -> Result<()> {
 
         let mut respawn_collected = false;
         while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
+            let RespawnResult {
+                index,
+                planned,
+                channel_id,
+                replacement_state,
+                result,
+            } = rr;
+            crash_history[index].respawn_in_flight = false;
+            match result {
                 Ok((acp, protocol_version, agent_name)) => {
+                    let replacement_state =
+                        replacement_state.unwrap_or_else(|| ReplacementState::from_config(&config));
                     let agent = OwnedAgent {
-                        index: rr.index,
+                        index,
                         acp,
                         state: SessionState::default(),
                         model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        desired_model_request_id: None,
-                        desired_model_pending_ack: false,
+                        desired_model: replacement_state.desired_model,
+                        model_overridden: replacement_state.model_overridden,
+                        desired_model_request_id: replacement_state.desired_model_request_id,
+                        desired_model_pending_ack: replacement_state.desired_model_pending_ack,
                         startup_effort: config.effort_level.clone(),
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
                     };
                     pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
+                    tracing::info!(agent = index, planned, "respawn complete");
                     respawn_collected = true;
                 }
                 Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
+                    handle_respawn_failure(
+                        &mut crash_history[index],
+                        planned,
+                        observer.as_ref(),
+                        index,
+                        channel_id,
+                        replacement_state.as_ref(),
+                        &e,
+                    );
                 }
             }
         }
@@ -4664,6 +4811,50 @@ fn spawn_failure_notice(
     }
 }
 
+fn acp_error_requires_connection_replacement(error: &acp::AcpError) -> bool {
+    match error {
+        acp::AcpError::Io(_)
+        | acp::AcpError::WriteTimeout(_)
+        | acp::AcpError::Timeout(_)
+        | acp::AcpError::Protocol(_)
+        | acp::AcpError::AgentExited => true,
+        acp::AcpError::SessionCloseFailed { source } => {
+            acp_error_requires_connection_replacement(source)
+        }
+        acp::AcpError::SetupAndCleanupFailed { cleanup, .. } => {
+            acp_error_requires_connection_replacement(cleanup)
+        }
+        _ => false,
+    }
+}
+
+/// True for errors where the connection cannot be safely reused for a bounded
+/// single-session runtime, but the adapter itself did not crash. These paths
+/// use planned replacement and do not charge `SlotCircuit`.
+fn is_planned_connection_retirement(error: &acp::AcpError) -> bool {
+    if acp_error_requires_connection_replacement(error) {
+        return false;
+    }
+    matches!(
+        error,
+        acp::AcpError::SessionCloseUnsupported { .. }
+            | acp::AcpError::SessionCapacityExceeded { .. }
+            | acp::AcpError::SessionCloseFailed { .. }
+            | acp::AcpError::SetupAndCleanupFailed { .. }
+    )
+}
+
+fn acp_error_code(error: &acp::AcpError) -> Option<i64> {
+    match error {
+        acp::AcpError::AgentError { code, .. } => Some(*code),
+        acp::AcpError::SessionCloseFailed { source } => acp_error_code(source),
+        acp::AcpError::SetupAndCleanupFailed { primary, cleanup } => {
+            acp_error_code(primary).or_else(|| acp_error_code(cleanup))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -4742,6 +4933,18 @@ fn handle_prompt_result(
                 // problem, not the deterministic hard-cap death below — the
                 // original batch must survive with no retry/dead-letter
                 // accounting, same as a clean cancel.
+                let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
+                queue.requeue_as_cancelled(batch, reason);
+            } else if matches!(
+                &result.outcome,
+                PromptOutcome::Error(error) if is_planned_connection_retirement(error)
+            ) && batch.cancel_reason.is_some()
+            {
+                // The prompt was already cancelled and its session could not
+                // be released because a bounded adapter lacks session/close
+                // (or rejected cleanup). The connection is being replaced,
+                // but the user's interrupted batch still has cancel/merge
+                // semantics; do not turn it into an ordinary retry/dead-letter.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
             } else if matches!(
@@ -4850,6 +5053,7 @@ fn handle_prompt_result(
     // agent was checked out. This covers the gap where invalidate_channel_sessions
     // only touches idle agents.
     for ch in removed_channels {
+        result.agent.queue_channel_closes_for_invalidation(*ch);
         result.agent.state.invalidate_channel(ch);
     }
 
@@ -5026,18 +5230,36 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
-            let is_transport_error = matches!(
-                e,
-                acp::AcpError::Io(_)
-                    | acp::AcpError::WriteTimeout(_)
-                    | acp::AcpError::Timeout(_)
-                    | acp::AcpError::Protocol(_)
-            );
-            let error_code = match &e {
-                acp::AcpError::AgentError { code, .. } => Some(*code),
-                _ => None,
-            };
-            if is_transport_error {
+            let is_transport_error = acp_error_requires_connection_replacement(e);
+            let error_code = acp_error_code(e);
+            if is_planned_connection_retirement(e) {
+                tracing::warn!(
+                    agent = agent_index,
+                    outcome = outcome_label,
+                    configured_model = %harness_configured_model,
+                    pid = harness_pid,
+                    error = %e,
+                    "connection ownership cannot be safely reused — planned replacement"
+                );
+                emit_turn_error(&e.to_string(), error_code);
+
+                let index = result.agent.index;
+                let slot_history = &mut crash_history[index];
+                if !spawn_planned_replacement_task(
+                    result.agent,
+                    config,
+                    slot_history,
+                    respawn_tx,
+                    respawn_tasks,
+                    observer,
+                    channel_id,
+                ) && pool.live_count() == 0
+                    && !any_respawn_in_flight(crash_history)
+                {
+                    tracing::error!("all agents dead — planned replacement did not start");
+                    return LoopAction::Exit;
+                }
+            } else if is_transport_error {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
@@ -5184,12 +5406,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let guard = RespawnGuard::new(i, respawn_tx.clone());
+    let max_sessions = config.max_sessions_per_connection;
+    let guard = RespawnGuard::new(i, false, None, None, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, max_sessions, i, observer).await;
         guard.send(result);
     });
 }
@@ -5239,9 +5462,15 @@ fn dispatch_heartbeat(
     if *heartbeat_in_flight {
         return;
     }
-    let agent = match pool.try_claim(None) {
+    let agent = match pool.try_claim_heartbeat() {
         Some(a) => a,
-        None => return,
+        None => {
+            // No worker can accept a heartbeat session without evicting a
+            // resident conversation. Skip this tick; the next heartbeat
+            // retries once capacity frees up.
+            tracing::info!("heartbeat skipped: no session capacity available");
+            return;
+        }
     };
 
     let prompt_text = ctx
@@ -5415,7 +5644,8 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let guard = RespawnGuard::new(index, respawn_tx.clone());
+    let max_sessions = config.max_sessions_per_connection;
+    let guard = RespawnGuard::new(index, false, None, None, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
         let mut agent = old_agent;
@@ -5426,10 +5656,60 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, max_sessions, index, observer).await;
         guard.send(result);
     });
 
+    true
+}
+
+/// Retire a connection for a deliberate ownership/capability reason. This is
+/// the same bounded background shutdown/spawn seam as crash recovery, but it
+/// never records a crash or applies crash backoff. A missing `session/close`
+/// capability is a compatibility limitation, not evidence that the adapter
+/// process failed.
+fn spawn_planned_replacement_task(
+    old_agent: OwnedAgent,
+    config: &Config,
+    slot: &mut SlotCircuit,
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    channel_id: Option<Uuid>,
+) -> bool {
+    let index = old_agent.index;
+    if slot.respawn_in_flight {
+        tracing::warn!(agent = index, "planned replacement already in flight");
+        return false;
+    }
+    slot.respawn_in_flight = true;
+
+    let cmd = config.agent_command.clone();
+    let args = config.agent_args.clone();
+    let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
+    let max_sessions = config.max_sessions_per_connection;
+    // Deliberate retirement preserves any runtime model selection and its
+    // pending request correlation. The replacement's first session is the
+    // authority that eventually emits success/failure for that selection.
+    let replacement_state = Some(ReplacementState::from_agent(&old_agent));
+    let guard = RespawnGuard::new(
+        index,
+        true,
+        channel_id,
+        replacement_state,
+        respawn_tx.clone(),
+    );
+    respawn_tasks.spawn(async move {
+        let mut agent = old_agent;
+        agent.acp.shutdown().await;
+        drop(agent);
+
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, max_sessions, index, observer).await;
+        guard.send(result);
+    });
     true
 }
 
@@ -5470,6 +5750,7 @@ struct PoolStartup {
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
+    max_sessions_per_connection: Option<usize>,
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
@@ -5483,6 +5764,7 @@ impl PoolStartup {
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
+            max_sessions_per_connection: config.max_sessions_per_connection,
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
@@ -5507,6 +5789,7 @@ async fn initialize_agent_pool(
         .await;
         match spawn_result {
             Ok(mut acp) => {
+                acp.set_max_sessions_per_connection(startup.max_sessions_per_connection);
                 acp.set_observer(startup.observer.clone(), i);
                 let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
@@ -5606,12 +5889,14 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    max_sessions_per_connection: Option<usize>,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    acp.set_max_sessions_per_connection(max_sessions_per_connection);
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -9162,6 +9447,7 @@ mod build_mcp_servers_tests {
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            max_sessions_per_connection: None,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
@@ -9388,6 +9674,7 @@ mod error_outcome_emission_tests {
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            max_sessions_per_connection: None,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
@@ -9442,6 +9729,200 @@ mod error_outcome_emission_tests {
             })),
             "buzz-agent"
         );
+    }
+
+    #[tokio::test]
+    async fn planned_replacement_carries_model_selection_and_request_id() {
+        let mut agent = dummy_agent(0).await;
+        agent.desired_model = Some("model-b".into());
+        agent.model_overridden = true;
+        agent.desired_model_request_id = Some("pick-7".into());
+        agent.desired_model_pending_ack = true;
+
+        let expected = ReplacementState::from_agent(&agent);
+        let channel_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        let guard = RespawnGuard::new(0, true, Some(channel_id), Some(expected.clone()), tx);
+        guard.send(Err(anyhow::anyhow!("planned replacement failed")));
+
+        let result = rx.recv().await.expect("respawn result");
+        assert!(result.planned);
+        assert_eq!(result.channel_id, Some(channel_id));
+        assert_eq!(result.replacement_state, Some(expected));
+        agent.acp.shutdown().await;
+    }
+
+    #[test]
+    fn planned_replacement_failure_closes_pending_model_switch_without_success() {
+        let observer = ObserverHandle::in_process();
+        let state = ReplacementState {
+            desired_model: Some("model-b".into()),
+            model_overridden: true,
+            desired_model_request_id: Some("pick-8".into()),
+            desired_model_pending_ack: true,
+        };
+
+        let error = anyhow::anyhow!("replacement initialize failed");
+        let channel_id = Uuid::new_v4();
+        emit_planned_replacement_failure(Some(&observer), 2, Some(channel_id), &state, &error);
+
+        let events = observer.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "control_result");
+        assert_eq!(events[0].payload["status"], "failure");
+        assert_eq!(events[0].payload["modelId"], "model-b");
+        assert_eq!(events[0].payload["requestId"], "pick-8");
+        assert_eq!(events[0].payload["error"], "replacement initialize failed");
+        assert_eq!(events[0].channel_id, Some(channel_id.to_string()));
+    }
+
+    #[test]
+    fn planned_respawn_failure_opens_circuit_without_crash_history() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        };
+
+        handle_respawn_failure(
+            &mut slot,
+            true,
+            None,
+            0,
+            None,
+            None,
+            &anyhow::anyhow!("replacement initialize failed"),
+        );
+
+        assert!(slot.crash_times.is_empty());
+        assert!(slot.open_until.is_some());
+        assert!(!slot.can_refill(), "spawn failure must enforce cooldown");
+    }
+
+    #[test]
+    fn planned_ownership_errors_bypass_transport_and_crash_classification() {
+        let planned = [
+            AcpError::SessionCloseUnsupported {
+                session_id: "session-a".into(),
+            },
+            AcpError::SessionCapacityExceeded { capacity: 1 },
+            AcpError::SessionCloseFailed {
+                source: Box::new(AcpError::AgentError {
+                    code: -32002,
+                    message: "close rejected".into(),
+                }),
+            },
+            AcpError::SetupAndCleanupFailed {
+                primary: Box::new(AcpError::AgentError {
+                    code: -32001,
+                    message: "setup failed".into(),
+                }),
+                cleanup: Box::new(AcpError::SessionCloseUnsupported {
+                    session_id: "session-a".into(),
+                }),
+            },
+        ];
+
+        for error in planned {
+            assert!(is_planned_connection_retirement(&error), "{error:?}");
+            assert!(
+                !acp_error_requires_connection_replacement(&error),
+                "planned ownership error must not be treated as transport failure: {error:?}"
+            );
+        }
+
+        let cleanup_transport = AcpError::SetupAndCleanupFailed {
+            primary: Box::new(AcpError::AgentError {
+                code: -32001,
+                message: "setup failed".into(),
+            }),
+            cleanup: Box::new(AcpError::SessionCloseFailed {
+                source: Box::new(AcpError::Timeout(Duration::from_secs(1))),
+            }),
+        };
+        assert!(acp_error_requires_connection_replacement(
+            &cleanup_transport
+        ));
+        assert!(!is_planned_connection_retirement(&cleanup_transport));
+    }
+
+    #[tokio::test]
+    async fn planned_retirement_requests_do_not_charge_crash_history_before_spawn_result() {
+        for error in [
+            AcpError::SessionCloseUnsupported {
+                session_id: "session-a".into(),
+            },
+            AcpError::SessionCloseUnsupported {
+                session_id: "session-b".into(),
+            },
+            AcpError::SessionCapacityExceeded { capacity: 1 },
+        ] {
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: "planned-retirement".into(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                PromptResult {
+                    agent,
+                    source: PromptSource::Heartbeat,
+                    turn_id: "planned-retirement".into(),
+                    outcome: PromptOutcome::Error(error),
+                    batch: None,
+                },
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            );
+
+            assert!(crash_history[0].crash_times.is_empty());
+            assert!(crash_history[0].open_until.is_none());
+            assert!(crash_history[0].respawn_in_flight);
+            respawn_tasks.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn repeated_transport_failures_still_open_slot_circuit() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        };
+        assert!(matches!(slot.record_crash(), CrashVerdict::Respawn(_)));
+        assert!(matches!(slot.record_crash(), CrashVerdict::Respawn(_)));
+        assert!(matches!(slot.record_crash(), CrashVerdict::CircuitOpen));
+        assert!(slot.open_until.is_some());
     }
 
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
@@ -10669,6 +11150,85 @@ mod error_outcome_emission_tests {
             1,
             "exactly one turn_error event must be emitted"
         );
+    }
+
+    #[tokio::test]
+    async fn planned_retirement_after_cancel_preserves_cancelled_requeue() {
+        let channel_id = Uuid::new_v4();
+        let event = EventBuilder::new(Kind::Custom(9), "cancelled-before-retirement")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "planned-retirement-after-cancel".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "planned-retirement-after-cancel".into(),
+                outcome: PromptOutcome::Error(AcpError::SessionCloseUnsupported {
+                    session_id: "sess-cancelled".into(),
+                }),
+                batch: Some(batch),
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let requeued = queue
+            .flush_next()
+            .expect("cancelled batch must remain available for merge");
+        assert_eq!(requeued.events.len(), 1);
+        assert_eq!(requeued.cancelled_events.len(), 0);
+        assert_eq!(requeued.cancel_reason, Some(CancelReason::Steer));
+        assert_eq!(pool.live_count(), 0);
+        assert_eq!(respawn_tasks.len(), 1);
+        respawn_tasks.shutdown().await;
     }
 
     /// Explicit Stop (`ControlSignal::Cancel`) on cancel-drain expiry drops

@@ -470,19 +470,29 @@ pub fn run() {
                 let mut prev_orphans: HashSet<u32> = HashSet::new();
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
+                    // Build the sweep inputs from live roots only: a dead
+                    // root's nonce must not keep a detached descendant exempted
+                    // until a foreground sync runs (R1). `live_root_sweep_inputs`
+                    // probes each child with try_wait, reaps dead roots here,
+                    // and caches their exit status for the foreground sync.
+                    let (skip_pids, tracked_nonces): (Vec<u32>, HashSet<String>) = state
                         .managed_agent_processes
                         .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+                        .map(|mut runtimes| {
+                            managed_agents::live_root_sweep_inputs(&mut runtimes)
+                        })
                         .unwrap_or_default();
                     let prev = prev_orphans.clone();
                     let inst = instance_id.clone();
                     // Run the blocking syscall work off the async executor.
                     let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
+                        let orphans =
+                            managed_agents::sweep_system_agent_processes_with_grace_and_tracked_nonces(
+                                &inst,
+                                &skip_pids,
+                                &prev,
+                                &tracked_nonces,
+                            );
                         managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
                         orphans
                     })

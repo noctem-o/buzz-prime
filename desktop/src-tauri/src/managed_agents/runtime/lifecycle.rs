@@ -51,6 +51,52 @@ pub(crate) fn kill_stale_tracked_processes_with(
     changed
 }
 
+/// Build the periodic orphan-sweep inputs — root PIDs to skip and generation
+/// nonces to trust — from the runtime map, trusting only roots that are
+/// provably alive on this tick.
+///
+/// A generation nonce is trusted only while a genuinely live current managed
+/// root proves ownership, never because stale runtime bookkeeping still holds
+/// it. Each runtime's child is probed with `try_wait()`, the authoritative,
+/// PID-reuse-immune liveness check for that exact child:
+/// - `Ok(None)`: the root is live — its PID and nonce enter the sweep inputs.
+/// - `Ok(Some(status))`: the root died; it is reaped here (the background
+///   sweep is the reaper) and the exit status is cached so the foreground
+///   sync can still record the real exit code.
+/// - `Err(_)`: the child was already reaped (e.g. by the foreground sync) or
+///   its PID no longer belongs to it — dead either way, so its nonce is not
+///   trusted.
+///
+/// Dead roots therefore stop exempting their detached descendants on the very
+/// next periodic tick, without waiting for a foreground `list_managed_agents`
+/// sync.
+pub(crate) fn live_root_sweep_inputs(
+    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+) -> (Vec<u32>, std::collections::HashSet<String>) {
+    let mut skip_pids = Vec::new();
+    let mut tracked_nonces = std::collections::HashSet::new();
+    for runtime in runtimes.values_mut() {
+        match runtime.child.try_wait() {
+            // The root died: the background sweep is the reaper. Cache the
+            // exit status so a later foreground sync records the real code.
+            Ok(Some(status)) => {
+                if runtime.reaped_exit_status.is_none() {
+                    runtime.reaped_exit_status = Some(status);
+                }
+            }
+            // The root is live: its PID and nonce enter the sweep inputs.
+            Ok(None) => {
+                skip_pids.push(runtime.child.id());
+                tracked_nonces.insert(runtime.start_nonce.clone());
+            }
+            // Already reaped, or the PID no longer belongs to this child:
+            // dead either way, so the nonce is not trusted.
+            Err(_) => {}
+        }
+    }
+    (skip_pids, tracked_nonces)
+}
+
 pub fn sync_managed_agent_processes(
     records: &mut [ManagedAgentRecord],
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
@@ -62,19 +108,27 @@ pub fn sync_managed_agent_processes(
     for (key, runtime) in runtimes.iter_mut() {
         let status = match runtime.child.try_wait() {
             Ok(status) => status,
-            Err(error) => {
-                if let Some(record) = records
-                    .iter_mut()
-                    .find(|record| record.pubkey == key.pubkey)
-                {
-                    record.updated_at = now_iso();
-                    record.last_error = Some(format!("failed to inspect process state: {error}"));
-                    record.last_error_code = None;
+            Err(error) => match runtime.reaped_exit_status {
+                // The background sweep already reaped this child, so the
+                // `ECHILD` from a second `try_wait` is expected; the captured
+                // exit status is authoritative and the record keeps the real
+                // exit code instead of an inspect error.
+                Some(status) => Some(status),
+                None => {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.pubkey == key.pubkey)
+                    {
+                        record.updated_at = now_iso();
+                        record.last_error =
+                            Some(format!("failed to inspect process state: {error}"));
+                        record.last_error_code = None;
+                    }
+                    changed = true;
+                    exited.push(key.clone());
+                    continue;
                 }
-                changed = true;
-                exited.push(key.clone());
-                continue;
-            }
+            },
         };
 
         let Some(status) = status else {
