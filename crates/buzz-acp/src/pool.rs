@@ -3354,32 +3354,40 @@ pub async fn run_prompt_task(
                                 return;
                             }
                             Err(error) => {
-                                // Single production arm: classify the error→outcome
-                                // and outcome→batch-fate boundary once via the seam
-                                // shared with tests, then invalidate/publish/send once.
+                                // Single production arm: retain the moved primary via
+                                // the seam shared with tests, then build the
+                                // PromptOutcome only after the cleanup branch so a
+                                // failed bounded session-close cannot replace the
+                                // original cancellation/drain failure.
                                 let failure = classify_control_cancel_failure(
                                     &ctx,
                                     error,
                                     control_signal,
                                     batch,
                                 );
-                                let mut outcome = failure.outcome;
-                                if failure.invalidate_all {
+                                let outcome = if failure.invalidate_all {
                                     agent.state.invalidate_all();
+                                    cancel_failure_outcome(failure.primary)
                                 } else {
-                                    if let Err(cleanup) =
-                                        close_session_before_invalidation(&mut agent, &session_id)
-                                            .await
+                                    match close_session_before_invalidation(&mut agent, &session_id)
+                                        .await
                                     {
-                                        tracing::error!(
-                                            target: "pool::session",
-                                            "failed to release session after cancellation error: {cleanup}"
-                                        );
-                                        outcome = PromptOutcome::Error(cleanup);
-                                    } else {
-                                        agent.state.invalidate(&source);
+                                        Ok(()) => {
+                                            agent.state.invalidate(&source);
+                                            cancel_failure_outcome(failure.primary)
+                                        }
+                                        Err(cleanup) => {
+                                            tracing::error!(
+                                                target: "pool::session",
+                                                "failed to release session after cancellation error: {cleanup}"
+                                            );
+                                            PromptOutcome::Error(combine_cleanup_error(
+                                                failure.primary,
+                                                cleanup,
+                                            ))
+                                        }
                                     }
-                                }
+                                };
 
                                 let usage = agent.acp.take_turn_usage();
                                 publish_agent_turn_metric(
@@ -4982,11 +4990,15 @@ fn requeue_cancelled_batch(
 }
 
 /// Result of classifying a failed [`AcpClient::cancel_with_cleanup_grace`]
-/// call: the [`PromptOutcome`] to report and the triggering batch's fate,
+/// call: the retained primary failure and the triggering batch's fate,
 /// decided together so tests cross the exact error→outcome→batch-fate
-/// boundary the production `Err(error)` arm uses.
+/// boundary the production `Err(error)` arm uses. The primary is retained by
+/// move (it is not `Clone`) so a later bounded session-close cleanup failure
+/// can be combined with it instead of replacing it in the reported outcome.
 struct ControlCancelFailure {
-    outcome: PromptOutcome,
+    /// Original cancellation/drain failure, retained by move for the
+    /// production arm to map or combine with a cleanup failure.
+    primary: AcpError,
     retry_batch: Option<FlushBatch>,
     /// `AgentExited` invalidates every session on the agent; every other
     /// failure invalidates only the source that triggered this turn.
@@ -4994,10 +5006,16 @@ struct ControlCancelFailure {
 }
 
 /// Classify a failed control-signal cancellation (steer fallback, interrupt,
-/// or explicit stop) into the [`PromptOutcome`] to report and the triggering
+/// or explicit stop) into the retained primary failure and the triggering
 /// batch's fate. This is the single production seam used by the `Err(error)`
 /// arm of the control-cancel branch in [`run_prompt_task`] — the boundary
 /// this exists to keep singular, so regressions there are regression-tested.
+///
+/// The [`PromptOutcome`] is deliberately built by the production arm only
+/// after the bounded session-close cleanup branch: successful cleanup maps
+/// the primary through [`cancel_failure_outcome`], failed cleanup combines it
+/// through [`combine_cleanup_error`]. Neither path can silently drop the
+/// original failure.
 ///
 /// [`AcpError::CancelDrainTimeout`] is the expected, common case: the agent
 /// didn't stop within its bounded grace window. [`AcpError::HardTimeout`] is
@@ -5005,33 +5023,40 @@ struct ControlCancelFailure {
 /// own drain-deadline `HardTimeout` into `CancelDrainTimeout` before
 /// returning — but for defense in depth an unexpected `HardTimeout` at this
 /// bounded cancellation boundary must never regain real hard-cap/dead-letter
-/// classification, so it maps to `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`
-/// rather than `Timeout(Hard)`.
+/// classification, so [`cancel_failure_outcome`] maps it to
+/// `CancelDrainTimeout(CONTROL_CANCEL_GRACE)` rather than `Timeout(Hard)`.
 fn classify_control_cancel_failure(
     ctx: &PromptContext,
     error: AcpError,
     signal: ControlSignal,
     batch: Option<FlushBatch>,
 ) -> ControlCancelFailure {
-    let (outcome, invalidate_all) = match error {
-        AcpError::AgentExited => (PromptOutcome::AgentExited, true),
-        AcpError::IdleTimeout(_) => (PromptOutcome::Timeout(TimeoutKind::Idle), false),
-        AcpError::CancelDrainTimeout(grace) => (PromptOutcome::CancelDrainTimeout(grace), false),
+    let invalidate_all = matches!(error, AcpError::AgentExited);
+    ControlCancelFailure {
+        primary: error,
+        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
+        invalidate_all,
+    }
+}
+
+/// Map a retained cancellation/drain failure to the [`PromptOutcome`]
+/// reported when the bounded session-close cleanup succeeds (or is a no-op
+/// on unbounded connections). This keeps the error→outcome boundary
+/// singular: an unexpected [`AcpError::HardTimeout`] maps to
+/// `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`, never `Timeout(Hard)`, so it
+/// cannot dead-letter the batch or claim the configured cap.
+fn cancel_failure_outcome(primary: AcpError) -> PromptOutcome {
+    match primary {
+        AcpError::AgentExited => PromptOutcome::AgentExited,
+        AcpError::IdleTimeout(_) => PromptOutcome::Timeout(TimeoutKind::Idle),
+        AcpError::CancelDrainTimeout(grace) => PromptOutcome::CancelDrainTimeout(grace),
         // Defense in depth: this bounded cancellation API is documented to
         // translate its own HardTimeout into CancelDrainTimeout, so this arm
         // should be unreachable in practice. If it ever fires anyway, still
         // report the truthful non-hard outcome rather than the real hard-cap
         // (which would dead-letter the batch and claim the configured cap).
-        AcpError::HardTimeout { .. } => (
-            PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
-            false,
-        ),
-        other => (PromptOutcome::Error(other), false),
-    };
-    ControlCancelFailure {
-        outcome,
-        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
-        invalidate_all,
+        AcpError::HardTimeout { .. } => PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+        other => PromptOutcome::Error(other),
     }
 }
 
@@ -8891,7 +8916,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 case.signal.clone(),
                 Some(batch),
             );
-            assert_outcome_matches(&failure.outcome, case.expected_outcome);
+            assert_outcome_matches(
+                &cancel_failure_outcome(failure.primary),
+                case.expected_outcome,
+            );
             assert_eq!(
                 failure.invalidate_all, case.invalidate_all,
                 "{}: invalidate_all mismatch",
@@ -11774,7 +11802,7 @@ done"#
 mod session_cleanup_tests {
     use super::*;
     use crate::acp::{AcpClient, AcpError};
-    use crate::is_planned_connection_retirement;
+    use crate::{acp_error_requires_connection_replacement, is_planned_connection_retirement};
     use tests::make_prompt_context_no_owner;
 
     /// Build a Goose-shaped ACP worker whose system-prompt setup fails after
@@ -11891,5 +11919,159 @@ done"#
         assert!(matches!(error, AcpError::SetupAndCleanupFailed { .. }));
         assert!(is_planned_connection_retirement(&error));
         agent.acp.shutdown().await;
+    }
+
+    /// Drive the production control-cancel `Err` arm end to end: the prompt
+    /// never completes, the bounded `session/close` fails, and the reported
+    /// outcome must carry both the original drain failure and the cleanup
+    /// failure instead of the cleanup error alone.
+    #[tokio::test]
+    async fn control_cancel_close_failure_preserves_primary_and_cleanup() {
+        let marker =
+            std::env::temp_dir().join(format!("buzz-acp-cancel-drain-{}.marker", Uuid::new_v4()));
+        let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{"sessionCapabilities":{{"close":{{}}}}}}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    : # session/prompt: leave in flight — the drain must expire
+    touch '{quoted_marker}'
+  elif [ "$count" -eq 3 ]; then
+    : # session/cancel is a notification — no response
+  elif [ "$count" -eq 4 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32002,"message":"close failed"}}}}'
+  fi
+done"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn drain-timeout ACP script");
+        acp.initialize()
+            .await
+            .expect("initialize drain-timeout ACP");
+        acp.set_max_sessions_per_connection(Some(1));
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "drain-timeout-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent.state.heartbeat_session = Some("sess-1".into());
+
+        let ctx = Arc::new(make_prompt_context_no_owner());
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+        let task = tokio::spawn(run_prompt_task(
+            agent,
+            None,
+            Some("cancel me".to_string()),
+            Arc::clone(&ctx),
+            result_tx,
+            Some(control_rx),
+            "turn-cancel-drain".to_string(),
+        ));
+
+        // Wait until the prompt is provably at the agent before firing the
+        // cancel, so the in-flight guard cannot race the cancel branch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prompt never reached the scripted agent"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        control_tx
+            .send(ControlSignal::Cancel)
+            .expect("send cancel signal");
+
+        let mut result = result_rx.recv().await.expect("prompt result");
+        let PromptOutcome::Error(error) = &result.outcome else {
+            panic!("expected an Error outcome carrying both failures");
+        };
+        let display = error.to_string();
+        assert!(
+            display.contains("did not stop within"),
+            "primary drain failure must survive: {display}"
+        );
+        assert!(
+            display.contains("close failed"),
+            "cleanup failure must be recorded: {display}"
+        );
+        assert!(
+            matches!(error, AcpError::SetupAndCleanupFailed { .. }),
+            "both failures must be combined: {display}"
+        );
+        assert!(
+            is_planned_connection_retirement(error),
+            "a failed close after a drain timeout retires planned, not as a transport crash"
+        );
+        result.agent.acp.shutdown().await;
+        task.await.expect("prompt task joins");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// Seam witness: the classifier hands the moved primary to the production
+    /// arm, and the arm's nonfatal combine preserves both failures while
+    /// keeping the planned-retirement classification.
+    #[test]
+    fn control_cancel_failure_retains_nonfatal_primary_for_cleanup_combining() {
+        let failure = classify_control_cancel_failure(
+            &make_prompt_context_no_owner(),
+            AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+            ControlSignal::Cancel,
+            None,
+        );
+        assert!(!failure.invalidate_all);
+        let combined = combine_cleanup_error(
+            failure.primary,
+            AcpError::SessionCloseFailed {
+                source: Box::new(AcpError::AgentError {
+                    code: -32002,
+                    message: "close failed".to_string(),
+                }),
+            },
+        );
+        assert!(matches!(combined, AcpError::SetupAndCleanupFailed { .. }));
+        let display = combined.to_string();
+        assert!(display.contains("did not stop within"), "{display}");
+        assert!(display.contains("close failed"), "{display}");
+        assert!(is_planned_connection_retirement(&combined));
+        assert!(!acp_error_requires_connection_replacement(&combined));
+    }
+
+    /// Seam witness: a connection-fatal primary is reported as-is, so the
+    /// transport classification comes from the real crash, not the cleanup.
+    #[test]
+    fn control_cancel_cleanup_combine_keeps_connection_fatal_primary() {
+        let failure = classify_control_cancel_failure(
+            &make_prompt_context_no_owner(),
+            AcpError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin broken",
+            )),
+            ControlSignal::Cancel,
+            None,
+        );
+        let combined = combine_cleanup_error(
+            failure.primary,
+            AcpError::SessionCloseUnsupported {
+                session_id: "sess-1".to_string(),
+            },
+        );
+        assert!(matches!(combined, AcpError::Io(_)));
+        assert!(acp_error_requires_connection_replacement(&combined));
+        assert!(!is_planned_connection_retirement(&combined));
     }
 }
