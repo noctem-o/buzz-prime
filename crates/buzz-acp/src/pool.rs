@@ -1818,12 +1818,19 @@ async fn create_session_and_apply_model(
                     {
                         Ok(result) => result,
                         Err(error) => {
+                            // Keep the deferred pick armed across a failed
+                            // setup attempt. The replacement path is the
+                            // retry boundary; clearing this flag here would
+                            // leave Desktop without a correlated terminal
+                            // result if the next session is the one that
+                            // eventually applies the model.
+                            agent.desired_model_pending_ack = pending_ack;
                             return Err(close_new_session_after_setup_failure(
                                 agent,
                                 &resp.session_id,
                                 error,
                             )
-                            .await)
+                            .await);
                         }
                     };
                 match switch_result {
@@ -11988,6 +11995,52 @@ done"#
             !agent.desired_model_pending_ack,
             "the pending-ack is consumed even on rejection so it cannot re-fire"
         );
+    }
+
+    #[tokio::test]
+    async fn test_busy_path_transport_failure_restores_pending_ack_for_replacement() {
+        // A dead adapter after session/new is a transport failure, not an
+        // application-level model rejection. The replacement must retain the
+        // deferred pick so its first successful session can emit the
+        // correlated terminal result.
+        let script = format!(
+            r#"read -r _session
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{OPTS_MODEL_A_AND_B}}}}}'
+read -r _switch
+exit 0"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn transport-failure ACP script");
+        let mut agent = switching_agent(acp, "model-b");
+        agent.desired_model_pending_ack = true;
+        agent.desired_model_request_id = Some("req-transport-failure".into());
+
+        let ctx = make_prompt_context_no_owner();
+        let result = create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: None,
+                channel_type: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcpError::AgentExited)));
+        assert!(
+            agent.desired_model_pending_ack,
+            "a transport failure must leave the deferred pick armed for replacement"
+        );
+        assert_eq!(
+            agent.desired_model_request_id.as_deref(),
+            Some("req-transport-failure")
+        );
+        agent.acp.shutdown().await;
     }
 
     #[tokio::test]
