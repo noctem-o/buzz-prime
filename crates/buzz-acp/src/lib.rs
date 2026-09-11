@@ -9796,6 +9796,7 @@ mod error_outcome_emission_tests {
 
         assert!(slot.crash_times.is_empty());
         assert!(slot.open_until.is_some());
+        assert!(!slot.can_refill(), "spawn failure must enforce cooldown");
     }
 
     #[test]
