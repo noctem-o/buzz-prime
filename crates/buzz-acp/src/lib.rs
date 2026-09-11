@@ -9740,12 +9740,14 @@ mod error_outcome_emission_tests {
         agent.desired_model_pending_ack = true;
 
         let expected = ReplacementState::from_agent(&agent);
+        let channel_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(1);
-        let guard = RespawnGuard::new(0, true, None, Some(expected.clone()), tx);
+        let guard = RespawnGuard::new(0, true, Some(channel_id), Some(expected.clone()), tx);
         guard.send(Err(anyhow::anyhow!("planned replacement failed")));
 
         let result = rx.recv().await.expect("respawn result");
         assert!(result.planned);
+        assert_eq!(result.channel_id, Some(channel_id));
         assert_eq!(result.replacement_state, Some(expected));
         agent.acp.shutdown().await;
     }
