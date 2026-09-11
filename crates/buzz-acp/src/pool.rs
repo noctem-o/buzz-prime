@@ -1155,6 +1155,42 @@ impl AgentPool {
         None
     }
 
+    /// Claim a worker for low-priority heartbeat work without evicting a
+    /// resident session.
+    ///
+    /// A heartbeat may reuse the worker that already holds its own heartbeat
+    /// session (preserving that conversation's identity across ticks) or any
+    /// worker with a free remote-session slot, including pending closes the
+    /// task will flush before its next `session/new`. When no worker can
+    /// accept a heartbeat session, return `None` so the caller skips this
+    /// tick and retries on the next heartbeat — evicting a live user
+    /// conversation to run heartbeat work is not allowed.
+    pub(crate) fn try_claim_heartbeat(&mut self) -> Option<OwnedAgent> {
+        // Pass 1: reuse the worker that already holds the heartbeat's own
+        // session. It is not a user scope, so scope-based claims never
+        // reach it; only the heartbeat may take it.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_ref() else {
+                continue;
+            };
+            if agent.state.heartbeat_session.is_some() {
+                return self.agents[idx].take();
+            }
+        }
+
+        // Pass 2: free capacity or reclaimable pending closes. Never evict —
+        // a capacity-full worker keeps every resident session intact.
+        for idx in 0..self.agents.len() {
+            let Some(agent) = self.agents[idx].as_ref() else {
+                continue;
+            };
+            if agent.can_create_session() || agent.acp.has_pending_session_closes() {
+                return self.agents[idx].take();
+            }
+        }
+        None
+    }
+
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, mut agent: OwnedAgent) {
         let stale_scopes: Vec<SessionScope> = agent
@@ -10832,6 +10868,460 @@ done"#
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+
+    // ── R2: heartbeats must never evict resident user conversations ────────
+    //
+    // These witnesses drive the real `crate::dispatch_heartbeat` production
+    // seam against a scripted ACP adapter that captures every wire request,
+    // so the assertions hold on actual `session/new`, `session/close`, and
+    // `session/prompt` traffic — not only in-memory bookkeeping.
+
+    /// Scripted ACP adapter that appends every received request to `capture`.
+    /// Responses are deterministic: initialize advertises close, session/new
+    /// returns `sess-<request-id>`, session/close is a no-op, and prompt ends
+    /// with `end_turn`. Each response id is parsed from the request line
+    /// itself, so the adapter tracks the client's real JSON-RPC id sequence
+    /// instead of assuming one request per line.
+    async fn r2_witness_adapter(capture: &std::path::Path) -> AcpClient {
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{{"close":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"sess-%s"}}}}\n' "$id" "$id" ;;
+    *'"method":"session/close"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      id=${{line#*\"id\":}}; id=${{id%%,*}}
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id" ;;
+  esac
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn R2 witness ACP script")
+    }
+
+    fn r2_witness_agent(client: AcpClient) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp: client,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "r2-witness-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Wait for the single result the dispatched prompt task sends on
+    /// completion, then drain the channel. The result is the task's terminal
+    /// action, so once it is in hand the turn's wire traffic is fully captured.
+    async fn r2_settle_results(pool: &mut AgentPool, budget: Duration) -> Vec<PromptResult> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut results = Vec::new();
+        loop {
+            match pool.result_rx_try_recv() {
+                Ok(result) => {
+                    results.push(result);
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        while let Ok(result) = pool.result_rx_try_recv() {
+            results.push(result);
+        }
+        results
+    }
+
+    fn r2_read_wire(capture: &std::path::Path) -> String {
+        let wire = std::fs::read_to_string(capture).expect("wire capture written");
+        let _ = std::fs::remove_file(capture);
+        wire
+    }
+
+    fn r2_count_method(wire: &str, method: &str) -> usize {
+        wire.lines()
+            .filter(|line| line.contains(&format!("\"method\":\"{method}\"")))
+            .count()
+    }
+
+    /// R2 witness: at capacity one, with one worker holding one live user
+    /// conversation, a heartbeat tick must skip — leaving the conversation
+    /// owned, spawning no task, and sending no session/close or second
+    /// session/new on the wire.
+    #[tokio::test]
+    async fn heartbeat_at_capacity_one_skips_instead_of_evicting_live_conversation() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-skip-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let user_scope = conv(Uuid::new_v4());
+        let mut agent = r2_witness_agent(client);
+        agent.state.sessions.insert(user_scope.clone(), user_sid);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(user_scope.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(user_scope.clone(), generation);
+        assert!(
+            pool.has_session_for(&user_scope),
+            "setup: the resident session must be claimable by its scope"
+        );
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+
+        // The skip decision is synchronous: if the tick was skipped, no task
+        // was spawned, so in-flight state and wire state are final right now.
+        assert!(
+            !in_flight,
+            "skipped tick must leave heartbeat_in_flight clear"
+        );
+        assert!(
+            pool.task_map().is_empty(),
+            "skipped tick must not spawn a prompt task"
+        );
+        assert!(
+            pool.has_session_for(&user_scope),
+            "the live conversation must stay owned by its worker after a skipped tick"
+        );
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat opened a second session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "heartbeat closed the user session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            0,
+            "heartbeat sent a prompt: {wire}"
+        );
+    }
+
+    /// R2 witness: a heartbeat that already owns a session at full capacity
+    /// must keep prompting in that exact session — no rotation, no close —
+    /// instead of evicting its way to a fresh slot.
+    #[tokio::test]
+    async fn heartbeat_reuses_resident_heartbeat_session_at_full_capacity() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-reuse-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+
+        let mut pool = AgentPool::from_slots(vec![Some(r2_witness_agent(client))]);
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        // Tick 1: free capacity — the heartbeat creates its own session.
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "free-capacity tick must run");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "first heartbeat must complete");
+        let first = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(first.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = first
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("first heartbeat records its session");
+        pool.return_agent(first.agent);
+        // The production supervisor clears this flag while consuming the
+        // completed heartbeat result. The witness consumes the result
+        // directly, so mirror that state transition before the next tick.
+        in_flight = false;
+
+        // Tick 2: full capacity — the heartbeat must reuse its own session
+        // instead of rotating it (and certainly not evict anything).
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(
+            in_flight,
+            "full-capacity tick must run on the worker holding the heartbeat session"
+        );
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "second heartbeat must complete");
+        let second = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(second.outcome, PromptOutcome::Ok(_)));
+        assert_eq!(
+            second.agent.state.heartbeat_session,
+            Some(hb_sid.clone()),
+            "heartbeat session identity must not rotate at full capacity"
+        );
+        pool.return_agent(second.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat rotated its own session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "heartbeat closed its own live session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            2,
+            "each tick must prompt: {wire}"
+        );
+    }
+
+    /// Control: with free capacity the heartbeat still runs — the skip must
+    /// only kick in at the capacity limit.
+    #[tokio::test]
+    async fn heartbeat_with_free_capacity_still_runs() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-free-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+
+        let mut pool = AgentPool::from_slots(vec![Some(r2_witness_agent(client))]);
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "free-capacity tick must run");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 1, "heartbeat must complete");
+        let first = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(first.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = first
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("heartbeat session recorded");
+        assert!(!hb_sid.is_empty());
+        pool.return_agent(first.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            1,
+            "heartbeat must create its session: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            0,
+            "no close expected: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            1,
+            "heartbeat must prompt: {wire}"
+        );
+    }
+
+    /// R2 witness: a skipped tick must not poison the schedule. After the
+    /// skipped tick, user work on the resident scope still claims and reuses
+    /// its session, and once the channel is removed the heartbeat runs on the
+    /// freed worker.
+    #[tokio::test]
+    async fn skipped_heartbeat_tick_does_not_poison_scheduling() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-no-poison-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let user_scope = conv(Uuid::new_v4());
+        let channel_id = user_scope.channel_id();
+        let mut agent = r2_witness_agent(client);
+        agent
+            .state
+            .sessions
+            .insert(user_scope.clone(), user_sid.clone());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(user_scope.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(user_scope.clone(), generation);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.heartbeat_prompt = Some("r2 witness heartbeat".into());
+        let ctx = Arc::new(ctx);
+
+        // Tick 1: full capacity → skip; the conversation survives.
+        let mut in_flight = false;
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(!in_flight, "tick 1 must skip at full capacity");
+        assert!(pool.task_map().is_empty(), "tick 1 must not spawn a task");
+        assert!(
+            pool.has_session_for(&user_scope),
+            "user conversation must survive the skipped tick"
+        );
+
+        // User work on the same scope still functions: the claim reuses the
+        // resident session, evicting nothing.
+        let claimed = pool
+            .try_claim(Some(&user_scope))
+            .expect("user work must claim the worker");
+        assert_eq!(
+            claimed.state.sessions.get(&user_scope),
+            Some(&user_sid),
+            "user turn must reuse the resident session"
+        );
+        pool.return_agent(claimed);
+        assert!(
+            pool.has_session_for(&user_scope),
+            "user session must survive the user turn"
+        );
+
+        // Channel removal frees the capacity through the production
+        // invalidation seam: the session is invalidated and its close queued
+        // for the next session/new to flush.
+        let invalidated = pool.invalidate_channel_sessions(channel_id);
+        assert_eq!(
+            invalidated, 1,
+            "channel removal must invalidate the resident session"
+        );
+
+        // Tick 2: the skipped tick must not have poisoned the schedule — the
+        // heartbeat now runs on the freed worker.
+        crate::dispatch_heartbeat(&mut pool, &ctx, &mut in_flight);
+        assert!(in_flight, "tick 2 must run once capacity is free");
+        let results = r2_settle_results(&mut pool, Duration::from_secs(15)).await;
+        assert_eq!(
+            results.len(),
+            1,
+            "heartbeat must complete after capacity frees"
+        );
+        let second = results.into_iter().next().expect("heartbeat result");
+        assert!(matches!(second.outcome, PromptOutcome::Ok(_)));
+        let hb_sid = second
+            .agent
+            .state
+            .heartbeat_session
+            .clone()
+            .expect("heartbeat session recorded");
+        assert_ne!(
+            hb_sid, user_sid,
+            "heartbeat must not squat in the user session"
+        );
+        pool.return_agent(second.agent);
+
+        let wire = r2_read_wire(&capture);
+        assert_eq!(
+            r2_count_method(&wire, "session/new"),
+            2,
+            "user + heartbeat sessions only: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/close"),
+            1,
+            "the invalidated user session is closed exactly once: {wire}"
+        );
+        assert_eq!(
+            r2_count_method(&wire, "session/prompt"),
+            1,
+            "heartbeat prompt only: {wire}"
+        );
+    }
+
+    /// Control: the R2 change must not weaken legitimate user-work eviction.
+    /// A claim for a different scope at full capacity still evicts the
+    /// resident session and queues its remote close.
+    #[tokio::test]
+    async fn user_claim_still_evicts_resident_session_at_capacity_one() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-r2-user-evict-{}.ndjson", Uuid::new_v4()));
+        let mut client = r2_witness_adapter(&capture).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let user_sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("user session/new should succeed")
+            .session_id;
+
+        let scope_a = conv(Uuid::new_v4());
+        let mut agent = r2_witness_agent(client);
+        agent.state.sessions.insert(scope_a.clone(), user_sid);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let generation = pool.record_scope_owner(scope_a.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("agent in slot")
+            .state
+            .set_scope_owner_generation(scope_a.clone(), generation);
+
+        let scope_b = conv(Uuid::new_v4());
+        let claimed = pool
+            .try_claim(Some(&scope_b))
+            .expect("user work must claim a worker at full capacity");
+        assert!(
+            !claimed.state.sessions.contains_key(&scope_a),
+            "resident session must be evicted for user work"
+        );
+        assert!(
+            claimed.acp.has_pending_session_closes(),
+            "evicted session must be queued for remote close"
+        );
+        assert!(!pool.any_idle(), "the worker is checked out");
     }
 }
 
