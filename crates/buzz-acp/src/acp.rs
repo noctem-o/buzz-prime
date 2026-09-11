@@ -733,7 +733,13 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
         tracing::info!(target: "acp::session", "session created: {session_id}");
-        self.remote_sessions.insert(session_id.clone());
+        // The ledger drives capacity accounting and close-before-invalidate,
+        // both of which only exist on bounded connections. Legacy unbounded
+        // connections never send `session/close`, so their session IDs would
+        // accumulate here forever; track only what the bookkeeping needs.
+        if self.has_bounded_session_capacity() {
+            self.remote_sessions.insert(session_id.clone());
+        }
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -5359,5 +5365,137 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+
+    // ── R3: bounded-capacity bookkeeping must not accumulate an unbounded
+    //    historical remote-session-ID ledger in legacy unbounded mode ──────
+
+    #[tokio::test]
+    async fn legacy_unbounded_rotations_keep_remote_session_ledger_bounded() {
+        // Repeated session rotations on a legacy unbounded connection must not
+        // grow the remote-session ledger without bound: in unbounded mode the
+        // ledger serves no purpose (no capacity accounting, no close to queue)
+        // and nothing ever removes entries from it.
+        let script = r#"
+            while IFS= read -r line; do
+              id=${line#*\"id\":}; id=${id%%,*}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"sessionId":"rot-'$id'"}}' ;;
+              esac
+            done
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.has_bounded_session_capacity());
+        for _ in 0..8 {
+            client
+                .session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("legacy unbounded rotation must reach the wire");
+        }
+        assert!(
+            client.remote_sessions.is_empty(),
+            "unbounded-mode ledger accumulated historical session IDs: {:?}",
+            client.remote_sessions
+        );
+        assert_eq!(client.live_session_count(), 0);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_remote_session_ledger_still_tracks_new_and_close() {
+        // The R3 gate must not weaken bounded-mode bookkeeping: every new
+        // session is tracked and removed again on close.
+        let script = r#"
+            while IFS= read -r line; do
+              id=${line#*\"id\":}; id=${id%%,*}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"sessionId":"ledger-'$id'"}}' ;;
+                *'"method":"session/close"'*)
+                  printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{}}' ;;
+              esac
+            done
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_max_sessions_per_connection(Some(1));
+        let sid = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session/new should succeed")
+            .session_id;
+        assert_eq!(client.live_session_count(), 1);
+        assert!(client.remote_sessions.contains(&sid));
+        client
+            .session_close(&sid)
+            .await
+            .expect("session/close should succeed");
+        assert_eq!(client.live_session_count(), 0);
+        assert!(!client.remote_sessions.contains(&sid));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_unbounded_wire_still_sends_each_rotation_and_never_closes() {
+        // Legacy unbounded wire semantics are unchanged by the R3 gate: every
+        // rotation is still sent as a real `session/new`, and no
+        // `session/close` is ever emitted on the wire.
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-unbounded-wire-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+            : > '{quoted_capture}'
+            while IFS= read -r line; do
+              printf '%s\n' "$line" >> '{quoted_capture}'
+              id=${{line#*\"id\":}}; id=${{id%%,*}}
+              case "$line" in
+                *'"method":"initialize"'*)
+                  printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}' ;;
+                *'"method":"session/new"'*)
+                  printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"sessionId":"wire-'$id'"}}}}' ;;
+              esac
+            done
+            "#
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(!client.has_bounded_session_capacity());
+        for _ in 0..4 {
+            client
+                .session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("rotation must reach the wire");
+        }
+        client.shutdown().await;
+        let wire = std::fs::read_to_string(&capture).expect("capture written");
+        let _ = std::fs::remove_file(&capture);
+        let news = wire
+            .lines()
+            .filter(|l| l.contains("\"method\":\"session/new\""))
+            .count();
+        let closes = wire
+            .lines()
+            .filter(|l| l.contains("\"method\":\"session/close\""))
+            .count();
+        assert_eq!(news, 4, "legacy wire must carry every rotation: {wire}");
+        assert_eq!(closes, 0, "legacy unbounded wire must never close: {wire}");
     }
 }
